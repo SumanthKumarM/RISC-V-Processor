@@ -471,6 +471,7 @@ module instruction_mem(
     reg [31:0]mem[63:0];
 
     // desired instruction to be preloaded 
+    // this instruction is given to load reg file with 1000,200 and add them and to store the result again in reg file
     initial begin
         mem[0]=32'b000011001000_01001_000_01001_0010011; // I instruction (rs1)
         mem[4]=32'b001111101000_01100_000_01100_0010011; // I instruction (rs2)
@@ -704,6 +705,7 @@ module non_rest_div(
     end
 endmodule
 
+// Test bench 
 module risc_tb;
 wire [31:0]pc,instr,ALUOUT;
 wire [4:0]RS1_addr,RS2_addr,RD_addr;
