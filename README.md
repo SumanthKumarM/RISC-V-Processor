@@ -1,6 +1,7 @@
 # RISC-V-Processor
 This is 32-bit processor based on RISC-V Instruction Set Architecture.  
 RISC-V ISA has 6 types of instructions :
+
 1) R-type : Register to register instruction
 2) I-type : Immediate type
 3) Store instruction : Writes data into data memory
@@ -14,6 +15,7 @@ This processor has been designed to support all the above mentioned instructions
 Assembler converts the assembly language into its corresponding instruction in binary format which is understandable by processor. In this project instructions are given in binary format according to the command we want to execute.
 There are a total of 8 modules included in this project. They are:
 1) Arithmetic Logic Unit (ALU) : This is one of the most important component of any processor that performs arithmetic and logic operations based on the instruction given. To make this ALU time efficient and area efficient, the ALU has been designed using the following circuits:
+   
 a) Carry Look Ahead Adder : This circuit is time efficient for word sizes like 32-bits. This adder is more time efficient that Ripple Carry adder as the output carry in every stage is dependant only on input carry. This circuit is used to carry out both 
 addition and subtraction. When input carry is given logic-0 the CLA performs addition and when input carry is logic-1 then the CLA performs subtraction.
 
