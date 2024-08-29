@@ -1,9 +1,9 @@
 # RISC-V-Processor
 This is 32-bit processor based on RISC-V Instruction Set Architecture.  
 RISC-V ISA has 6 types of instructions :
-                                        1) R-type : Register to register instruction
-                                        2) I-type : Immediate type
-                                        3) Store instruction : Writes data into data memory
+1) R-type : Register to register instruction
+2) I-type : Immediate type
+3) Store instruction : Writes data into data memory
                                         4) Load instruction : Reads data from data memory
                                         5) Branch type : updates program counter based on conditions
                                         6) JAL type : Jump and Link instruction
