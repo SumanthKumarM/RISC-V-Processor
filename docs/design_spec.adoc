@@ -1,0 +1,946 @@
+= RV32I+M Multi-Cycle Processor — Design Specification
+:doctype: book
+:toc:
+:toclevels: 4
+:toc-title: Contents
+:sectnums:
+:sectnumlevels: 4
+:sectanchors:
+:icons: font
+:source-highlighter: rouge
+:table-caption: Table
+:figure-caption: Figure
+:xrefstyle: short
+:experimental:
+:reproducible:
+
+== Introduction
+
+=== Purpose and Scope
+
+This document is the design specification for a synthesizable, single-issue,
+multi-cycle 32-bit RISC-V processor implementing the **RV32I** base integer
+instruction set together with the **RV32M** standard extension for integer
+multiplication and division. It describes, in full:
+
+* the instruction set actually decoded and executed by the hardware,
+* the microarchitecture (datapath, finite-state-machine control, and every
+  functional unit), including exact control-signal encodings taken directly
+  from the RTL,
+* the arithmetic algorithms underlying the adder/subtractor, multiplier, and
+  divider, and
+* the verification methodology and build/physical-design flow used to
+  develop and sign off the design.
+
+The specification is written to be self-contained: no external familiarity
+with the implementation source is required to understand what the processor
+does, cycle by cycle and bit by bit. Where the design deliberately narrows or
+diverges from the full RISC-V unprivileged specification (most notably, the
+absence of trap/CSR infrastructure), that divergence is called out explicitly
+rather than left implicit.
+
+=== Intended Audience
+
+Verification engineers writing tests or a reference model against this core,
+physical design engineers taking it through synthesis and static timing
+analysis, and anyone extending the RTL, should be able to treat this document
+as the single source of truth for expected behavior.
+
+=== Document Conventions
+
+* Register operands are written `rs1`, `rs2` (sources) and `rd` (destination).
+  `x0` is hardwired to the constant `0`; writes to it are discarded.
+* `pc` denotes the program counter, always a byte address.
+* `M[addr]` denotes a data-memory access; `SXT(·)` and `ZXT(·)` denote
+  sign-extension and zero-extension to 32 bits, respectively.
+* `<s` / `>=s` denote **signed** comparison; `<u` / `>=u` denote **unsigned**
+  comparison.
+* Bit fields are written `field[hi:lo]`, most-significant bit first. Binary
+  literals are grouped in nibbles/septets with underscores (e.g. `011_0011`)
+  to match RISC-V convention and the reference table this document's
+  instruction listing is organized after (see <<references>>).
+* "FMT" in the instruction tables is the instruction encoding format: **R**,
+  **I**, **S**, **B**, **U**, or **J** (see <<instruction-formats>>).
+* Source line references (e.g. `rtl/risc.v:148`) point at the file as of the
+  revision noted on the title page above.
+
+=== ISA Compliance Summary
+
+[cols="2,3,5", options="header"]
+|===
+| Extension | Status | Notes
+
+| RV32I base integer
+| Fully implemented
+| All 37 base instructions decode and execute correctly *except* `ecall` and
+  `ebreak`, which are recognized as valid opcodes by the RISC-V encoding but
+  are not wired to any control-transfer behavior — see
+  <<ecall-ebreak-behavior>>.
+
+| RV32M (integer multiply/divide)
+| Fully implemented
+| All 8 instructions (`mul`, `mulh`, `mulhsu`, `mulhu`, `div`, `divu`, `rem`,
+  `remu`), including the RISC-V-mandated divide-by-zero and signed-overflow
+  results (no trap taken in either case — see <<div-rem-special-cases>>).
+
+| Zicsr (CSR instructions)
+| Not implemented
+| No CSR file, no `csrrw`/`csrrs`/`csrrc`/immediate forms exist in the
+  decoder. Machine-mode CSRs (`mstatus`, `mtvec`, `mepc`, `mcause`, ...) are
+  entirely absent.
+
+| Zifencei / `fence`
+| Not implemented
+| `fence` and `fence.i` are not decoded; the design has no instruction cache
+  or out-of-order memory system that would require them, but the opcode is
+  simply unrecognized rather than treated as a no-op.
+
+| Traps / interrupts
+| Not implemented
+| There is no trap-taken mechanism of any kind: no exception vector, no
+  privilege levels, no external/timer/software interrupt inputs. An
+  unrecognized opcode does not fault — it halts the fetch/decode loop in
+  place (see <<controller-fsm>>).
+|===
+
+== Top-Level Architecture
+
+=== Module Hierarchy
+
+The processor is a single Verilog file, `rtl/risc.v`, structured as one
+top-level module (`risc_v`) instantiating ten functional-unit submodules.
+There is no clock gating, no pipelining, and no speculative execution: every
+instruction runs to completion through the finite-state machine described in
+<<controller-fsm>> before the next one is fetched.
+
+[cols="2,5", options="header"]
+.RTL Module Inventory
+|===
+| Module | Responsibility
+
+| `risc_v`               | Top level: instantiates every submodule below, forms the write-back data mux, and latches the JALR jump target (see <<jalr-latch>>).
+| `ALU`                  | All arithmetic/logical/compare operations, RV32M multiply/divide dispatch, and the JALR target address (`rs1 + immI`).
+| `controller`           | The 7-state instruction sequencer; derives every control signal (`ALUOP`, `IRMUX`, `PCMUX`, `WBMUX`, `MWR`, `WERF`, `BJ_sel`) from the current state and the instruction's opcode/funct3.
+| `instruction_dec`      | Combinationally decodes `ALUOP` from opcode/funct3/funct7; registers `rs1`/`rs2`/`rd` addresses and the raw immediate bit-buses on the decode→read_src_regs edge.
+| `data_mem`             | 64×32-bit byte-addressable data memory with independent per-byte write strobes.
+| `lsu_align`            | Load/store alignment: replicates a store value into the correct byte lane(s) and extracts/extends a sub-word load from the addressed word.
+| `instruction_mem`      | 256×32-bit instruction memory with a streaming load port for program initialization.
+| `reg_file`             | 32×32-bit register file, `x0` hardwired to zero, asynchronous read / synchronous write.
+| `prgm_cntr`            | The program counter register and its four update sources (hold, `+4`, branch/jump-relative, JALR-absolute).
+| `imm_gen`              | Sign-extends the I/S/B/J/U immediate fields per the RISC-V format definitions.
+| `carry_look_ahead`     | 32-bit carry-lookahead adder/subtractor — see <<cla-algorithm>>.
+| `Booths_mult`          | Radix-2 Booth multiplier, 32×32→64 — see <<booth-algorithm>>.
+| `non_rest_div`         | Non-restoring divider, 32÷32→(quotient, remainder) — see <<nrd-algorithm>>.
+|===
+
+=== Top-Level Interface
+
+[cols="2,1,1,4", options="header"]
+.`risc_v` Port List
+|===
+| Signal | Dir | Width | Purpose
+
+| `clock`, `reset`        | in  | 1  | System clock and synchronous, active-high reset.
+| `imem_load_en`          | in  | 1  | Program-load strobe — see <<instruction-memory>>.
+| `imem_load_data`        | in  | 32 | Instruction word streamed in while `imem_load_en` is high.
+| `pc`                    | out | 32 | Current program counter (address of the instruction being processed).
+| `instr`                 | out | 32 | The fetched instruction word.
+| `ALUOUT`                | out | 32 | Combinational ALU result for the current instruction.
+| `RS1_addr`, `RS2_addr`, `RD_addr` | out | 5 each | Decoded register-file addresses.
+| `Jump_target`           | out | 32 | Combinational JALR target (`rs1 + immI`); see <<jalr-latch>> for why the core does not use this signal directly.
+| `Branch_target`         | out | 1  | Raw (un-inverted) ALU compare result, used by the controller to resolve taken/not-taken branches.
+| `MWR`                   | out | 1  | Data-memory read/write select (`1`=read, `0`=write); see <<control-signals>>.
+| `WERF`                  | out | 1  | Register-file write enable.
+| `data_mem_out`          | out | 32 | Raw word read back from data memory (pre-alignment).
+| `write_data`            | out | 32 | The value about to be written back to the register file (observability only).
+| `WBMUX`, `IRMUX`, `PCMUX` | out | 3/2/2 | Control-mux selects; see <<control-signals>>.
+| `ALUOP`                 | out | 5  | ALU operation select; see <<alu-opcodes>>.
+|===
+
+Every output above besides `pc`, `instr`, and `ALUOUT` is exposed purely for
+observability (waveform debugging and the lockstep testbench's per-instruction
+state comparison, see <<verification>>) — none of them feed back into the
+core from outside.
+
+[[multi-cycle-model]]
+=== Multi-Cycle Execution Model
+
+The processor is **not** pipelined. Each instruction is sequenced through a
+subset of seven FSM states — `fetch`, `decode`, `read_src_regs`, `execute`,
+`rw_data_mem`, `write_back`, `call_nxt_pc` — one state per clock edge, before
+the next instruction is fetched. `pc` and `instr` are held constant for the
+full duration of an instruction, so every combinational signal derived from
+`instr` (immediates, `WBMUX`, `IRMUX`, `ALUOP`, ...) is stable across every
+state of that instruction; the write-back and next-PC logic both depend on
+this property. The exact state sequence — and therefore the cycle count — is
+instruction-class-dependent; see <<controller-fsm>> for the full per-class
+breakdown.
+
+== Instruction Set Architecture
+
+[[instruction-formats]]
+=== Instruction Encoding Formats
+
+RV32I defines six instruction encoding formats, distinguished by how the
+32-bit word is carved into `opcode`, register-address, and immediate fields.
+All six are fully decoded by `instruction_dec`.
+
+[cols="1,6", options="header"]
+.RV32I Instruction Formats
+|===
+| Format | Bit Layout (bit 31 down to bit 0)
+
+| R | `funct7[31:25]` · `rs2[24:20]` · `rs1[19:15]` · `funct3[14:12]` · `rd[11:7]` · `opcode[6:0]`
+| I | `imm[31:20]` · `rs1[19:15]` · `funct3[14:12]` · `rd[11:7]` · `opcode[6:0]`
+| S | `imm[31:25]` · `rs2[24:20]` · `rs1[19:15]` · `funct3[14:12]` · `imm[11:7]` · `opcode[6:0]`
+| B | `imm[31]` · `imm[30:25]` · `rs2[24:20]` · `rs1[19:15]` · `funct3[14:12]` · `imm[11:8]` · `imm[7]` · `opcode[6:0]`
+| U | `imm[31:12]` · `rd[11:7]` · `opcode[6:0]`
+| J | `imm[31]` · `imm[30:21]` · `imm[20]` · `imm[19:12]` · `rd[11:7]` · `opcode[6:0]`
+|===
+
+`opcode[6:0]` is always the low seven bits and is decoded first, in every
+format, to determine both the format itself and (together with `funct3` and,
+for R-type, `funct7`) the exact operation. This layout, and the instruction
+tables that follow, are organized identically to the project's RV32I quick
+reference (see <<references>>).
+
+=== RV32I Base Integer Instructions — Register/Immediate ALU Operations
+
+These are the ten R-type and nine I-type instructions decoded from opcodes
+`011_0011` and `001_0011`. `IMM_I` is the sign-extended 12-bit I-type
+immediate; `shamt` is the 5-bit shift amount (`rs2[4:0]` for register shifts,
+`imm[4:0]` for immediate shifts — the hardware masks to 5 bits uniformly, so
+any garbage in the unused upper immediate bits of `slli`/`srli`/`srai` is
+ignored rather than validated).
+
+[cols="1,3,1,1,1,1,4,3", options="header"]
+.RV32I Register/Immediate ALU Instructions
+|===
+| Inst | Name | FMT | Opcode | funct3 | funct7 | Description | Note
+
+| `add`  | ADD                      | R | `011_0011` | `000` | `000_0000` | `rd = rs1 + rs2`               |
+| `sub`  | SUB                      | R | `011_0011` | `000` | `010_0000` | `rd = rs1 - rs2`               |
+| `sll`  | Shift Left Logical       | R | `011_0011` | `001` | `000_0000` | `rd = rs1 << rs2[4:0]`         |
+| `slt`  | Set Less Than            | R | `011_0011` | `010` | `000_0000` | `rd = (rs1 <s rs2) ? 1 : 0`    |
+| `sltu` | Set Less Than (U)       | R | `011_0011` | `011` | `000_0000` | `rd = (rs1 <u rs2) ? 1 : 0`    |
+| `xor`  | XOR                      | R | `011_0011` | `100` | `000_0000` | `rd = rs1 ^ rs2`               |
+| `srl`  | Shift Right Logical      | R | `011_0011` | `101` | `000_0000` | `rd = rs1 >>u rs2[4:0]`        |
+| `sra`  | Shift Right Arithmetic   | R | `011_0011` | `101` | `010_0000` | `rd = rs1 >>s rs2[4:0]`        |
+| `or`   | OR                       | R | `011_0011` | `110` | `000_0000` | `rd = rs1 \| rs2`              |
+| `and`  | AND                      | R | `011_0011` | `111` | `000_0000` | `rd = rs1 & rs2`               |
+| `addi`  | ADD Immediate            | I | `001_0011` | `000` | —          | `rd = rs1 + IMM_I`             | `IMM_I = SXT(imm[11:0])`
+| `slli`  | Shift Left Logical Imm  | I | `001_0011` | `001` | `000_0000` | `rd = rs1 << shamt`            |
+| `slti`  | Set Less Than Imm       | I | `001_0011` | `010` | —          | `rd = (rs1 <s IMM_I) ? 1 : 0`  |
+| `sltiu` | Set Less Than Imm (U)  | I | `001_0011` | `011` | —          | `rd = (rs1 <u IMM_I) ? 1 : 0`  |
+| `xori`  | XOR Immediate           | I | `001_0011` | `100` | —          | `rd = rs1 ^ IMM_I`             |
+| `srli`  | Shift Right Logical Imm| I | `001_0011` | `101` | `000_0000` | `rd = rs1 >>u shamt`           |
+| `srai`  | Shift Right Arith Imm  | I | `001_0011` | `101` | `010_0000` | `rd = rs1 >>s shamt`           |
+| `ori`   | OR Immediate            | I | `001_0011` | `110` | —          | `rd = rs1 \| IMM_I`            |
+| `andi`  | AND Immediate           | I | `001_0011` | `111` | —          | `rd = rs1 & IMM_I`             |
+|===
+
+=== RV32I Base Integer Instructions — Memory, Control Flow, and Upper Immediates
+
+`IMM_I`, `IMM_S`, `IMM_B`, `IMM_J`, and `IMM_U` are the sign-extended
+immediates for each format, exactly as generated by `imm_gen` — see
+<<immediate-generation>> for their bit-level construction.
+
+[cols="1,4,1,1,1,4,3", options="header"]
+.RV32I Load/Store/Branch/Jump/Upper-Immediate Instructions
+|===
+| Inst | Name | FMT | Opcode | funct3 | Description | Note
+
+| `lb`    | Load Byte              | I | `000_0011` | `000` | `rd = SXT(M[rs1 + IMM_I][7:0])`   | `IMM_I = SXT(imm[11:0])`
+| `lh`    | Load Half              | I | `000_0011` | `001` | `rd = SXT(M[rs1 + IMM_I][15:0])`  |
+| `lw`    | Load Word              | I | `000_0011` | `010` | `rd = M[rs1 + IMM_I]`             |
+| `lbu`   | Load Byte (U)         | I | `000_0011` | `100` | `rd = ZXT(M[rs1 + IMM_I][7:0])`   |
+| `lhu`   | Load Half (U)         | I | `000_0011` | `101` | `rd = ZXT(M[rs1 + IMM_I][15:0])`  |
+| `sb`    | Store Byte             | S | `010_0011` | `000` | `M[rs1 + IMM_S][7:0] = rs2[7:0]`  | `IMM_S = SXT(imm[11:0])`
+| `sh`    | Store Half             | S | `010_0011` | `001` | `M[rs1 + IMM_S][15:0] = rs2[15:0]`|
+| `sw`    | Store Word             | S | `010_0011` | `010` | `M[rs1 + IMM_S] = rs2`            |
+| `beq`   | Branch Equal           | B | `110_0011` | `000` | `if (rs1 == rs2) pc += IMM_B`     | `IMM_B = SXT({imm[12:1], 1'b0})`
+| `bne`   | Branch Not Equal       | B | `110_0011` | `001` | `if (rs1 != rs2) pc += IMM_B`     |
+| `blt`   | Branch Less Than       | B | `110_0011` | `100` | `if (rs1 <s rs2) pc += IMM_B`     |
+| `bge`   | Branch Greater/Equal   | B | `110_0011` | `101` | `if (rs1 >=s rs2) pc += IMM_B`    |
+| `bltu`  | Branch Less Than (U)  | B | `110_0011` | `110` | `if (rs1 <u rs2) pc += IMM_B`     |
+| `bgeu`  | Branch Greater/Equal (U) | B | `110_0011` | `111` | `if (rs1 >=u rs2) pc += IMM_B`  |
+| `jal`   | Jump And Link          | J | `110_1111` | —     | `rd = pc + 4; pc += IMM_J`        | `IMM_J = SXT({imm[20:1], 1'b0})`
+| `jalr`  | Jump And Link Register | I | `110_0111` | `000` | `rd = pc + 4; pc = {(rs1 + IMM_I)[31:1], 1'b0}` | `IMM_I = SXT(imm[11:0])`
+| `lui`   | Load Upper Immediate   | U | `011_0111` | —     | `rd = IMM_U`                      | `IMM_U = {imm[31:12], 12'b0}`
+| `auipc` | Add Upper Imm to PC    | U | `001_0111` | —     | `rd = pc + IMM_U`                 |
+| `ecall` | Environment Call       | I | `111_0011` | `000` | *Not implemented* — see below     | `imm[11:0] = 0x000`
+| `ebreak`| Environment Break      | I | `111_0011` | `000` | *Not implemented* — see below     | `imm[11:0] = 0x001`
+|===
+
+[[ecall-ebreak-behavior]]
+`ecall`/`ebreak` behavior:: `instruction_dec` assigns them the encoding
+positions the RISC-V spec reserves (opcode `111_0011`, `funct3 = 000`,
+distinguished only by the 12-bit immediate), but `controller`'s `decode`
+state has no matching branch for opcode `111_0011`
+(`rtl/risc.v:207-217`): the `else` arm falls through and holds
+`next_state = fetch`. The FSM therefore parks at `fetch`/`decode`
+indefinitely at the instruction's own address — the same "spins in place"
+behavior any unrecognized opcode produces (see <<controller-fsm>>) — rather
+than transferring control to a handler, because no handler (no CSR file, no
+trap vector) exists to transfer control to.
+
+=== RV32M Standard Extension — Integer Multiplication and Division
+
+All eight RV32M instructions share the R-type encoding and opcode
+`011_0011` with the base integer set, distinguished by `funct7 = 000_0001`.
+`instruction_dec` recognizes this funct7 value and routes `funct3` directly
+into the ALU's operation-select field (see <<alu-opcodes>>).
+
+[cols="1,4,1,1,1,1,4,3", options="header"]
+.RV32M Multiply/Divide Instructions
+|===
+| Inst | Name | FMT | Opcode | funct3 | funct7 | Description | Note
+
+| `mul`    | Multiply, low word              | R | `011_0011` | `000` | `000_0001` | `rd = (rs1 * rs2)[31:0]`                        | Identical bit pattern for signed and unsigned interpretation.
+| `mulh`   | Multiply High (signed×signed)   | R | `011_0011` | `001` | `000_0001` | `rd = (rs1_s * rs2_s)[63:32]`                   |
+| `mulhsu` | Multiply High (signed×unsigned) | R | `011_0011` | `010` | `000_0001` | `rd = (rs1_s * rs2_u)[63:32]`                   |
+| `mulhu`  | Multiply High (unsigned×unsigned) | R | `011_0011` | `011` | `000_0001` | `rd = (rs1_u * rs2_u)[63:32]`                 |
+| `div`    | Divide, signed                  | R | `011_0011` | `100` | `000_0001` | `rd = rs1_s / rs2_s` (truncating toward 0)      | See <<div-rem-special-cases>>.
+| `divu`   | Divide, unsigned                | R | `011_0011` | `101` | `000_0001` | `rd = rs1_u / rs2_u`                            | See <<div-rem-special-cases>>.
+| `rem`    | Remainder, signed                | R | `011_0011` | `110` | `000_0001` | `rd = rs1_s % rs2_s` (sign follows dividend)    | See <<div-rem-special-cases>>.
+| `remu`   | Remainder, unsigned              | R | `011_0011` | `111` | `000_0001` | `rd = rs1_u % rs2_u`                            | See <<div-rem-special-cases>>.
+|===
+
+[[div-rem-special-cases]]
+.DIV/REM Special Cases (No Trap Is Taken)
+[cols="2,4,2,2", options="header"]
+|===
+| Instruction | Condition | Quotient (`rd` for DIV/DIVU) | Remainder (`rd` for REM/REMU)
+
+| `div` / `divu`  | Divisor = 0 | `0xFFFFFFFF` (all ones) | —
+| `rem` / `remu`  | Divisor = 0 | — | Dividend, unchanged
+| `div`           | Dividend = `0x80000000`, divisor = `0xFFFFFFFF` (signed overflow: `INT_MIN / -1`) | `0x80000000` | —
+| `rem`           | Same overflow condition | — | `0`
+|===
+
+These four rules are implemented identically — and independently — in both
+`rtl/risc.v`'s `non_rest_div` module (see <<nrd-algorithm>>) and the
+behavioral golden model `tb/riscv_ref.v` used for verification (see
+<<verification>>); unsigned division has no overflow case since there is no
+representable negative divisor.
+
+== Microarchitecture
+
+[[control-signals]]
+=== Control Signal Reference
+
+Five signals, all driven by `controller`, steer every datapath mux in the
+design. Their encodings are reproduced here directly from the RTL case
+statements.
+
+[cols="1,1,4", options="header"]
+.IRMUX — ALU Operand-B Select (`rtl/risc.v:245-254`)
+|===
+| Value | Selects | Used By
+| `00` | `immS` | Store instructions (address = `rs1 + immS`)
+| `01` | `immI` | I-type ALU ops, Loads, JALR (address/operand = `rs1 + immI`)
+| `10` | `rs2`  | R-type ALU ops (default for any other opcode)
+|===
+
+[cols="1,1,4", options="header"]
+.WBMUX — Register Write-Back Source Select (`rtl/risc.v:58-67`, `269-282`)
+|===
+| Value | Source | Used By
+| `000` | `pc + 4`      | JAL, JALR (return address)
+| `001` | `immU`        | LUI
+| `010` | `pc + immU`   | AUIPC
+| `011` | `ALUOUT`      | R-type, I-type ALU ops (default)
+| `100` | `load_result` | Loads (already size-narrowed/extended by `lsu_align`)
+|===
+
+[cols="1,1,4", options="header"]
+.PCMUX — Next-PC Source Select, Sampled Only During `call_nxt_pc` (`rtl/risc.v:304-344`)
+|===
+| Value | Next PC | Used By
+| `00` | `pc` (held)             | Every state except `call_nxt_pc`; also the fallback for an unrecognized opcode (halt).
+| `01` | `pc + 4`                | R-type, I-type, Load, Store, LUI, AUIPC, and any untaken branch.
+| `10` | `pc + immB` or `pc + immJ` (selected by `BJ_sel`) | Taken branch (`BJ_sel=0`) or JAL (`BJ_sel=1`).
+| `11` | `{JT_latched[31:1], 1'b0}` | JALR.
+|===
+
+[cols="1,1,4", options="header"]
+.MWR — Data Memory Access Type, Qualified Only During `rw_data_mem` (`rtl/risc.v:259-266`)
+|===
+| Value | Meaning | Notes
+| `1` | Read  | Also the default value in every other state, so the data-memory write-enable logic (`!MWR`) is never driven by an unknown value.
+| `0` | Write | Asserted only for Store instructions in `rw_data_mem`.
+|===
+
+WERF (register-file write enable) is asserted for exactly one cycle,
+during `write_back`, for every instruction that writes `rd` — every
+instruction class except Store and Branch (`rtl/risc.v:284-301`).
+
+[[alu-opcodes]]
+=== ALU Operation Encoding
+
+`ALUOP` is a 5-bit code produced by `instruction_dec` and held for the
+entire instruction (not gated to the `execute` state), because two later
+consumers still need the ALU's combinational result: the data-memory address
+during `rw_data_mem`, and the raw branch-compare bit `BT` during
+`call_nxt_pc`.
+
+[cols="1,5,1,5", options="header"]
+.ALU Operation Codes (`rtl/risc.v:89-96`, `148-174`)
+|===
+| Code | Operation | Code | Operation
+
+| 0  | ADD (also forms the JALR target when `instr` is JALR) | 12 | Set-Less-Than, signed
+| 1  | SUB (`A + ~B + 1`)                                    | 13 | Set-Less-Than, unsigned
+| 6  | AND                                                    | 14 | Equal (branch comparator)
+| 7  | OR                                                     | 16 | MUL (low 32 bits of product)
+| 8  | XOR                                                    | 17 | MULH (high 32 bits, signed × signed)
+| 9  | SLL                                                    | 18 | MULHSU (high 32 bits, signed × unsigned)
+| 10 | SRL                                                    | 19 | MULHU (high 32 bits, unsigned × unsigned)
+| 11 | SRA                                                    | 20 | DIV (signed quotient)
+|    |                                                        | 21 | DIVU (unsigned quotient)
+|    |                                                        | 22 | REM (signed remainder)
+|    |                                                        | 23 | REMU (unsigned remainder)
+|===
+
+Codes 2–5 and 15 are unused (reserved). The RV32M block is encoded as
+`5'b10_<funct3>` (i.e. bit 4 set), so `instruction_dec` maps a
+`funct7 = 000_0001` R-type instruction onto ALU codes 16–23 simply by
+concatenating `{2'b10, funct3}` — no separate lookup table is needed. Within
+the ALU, `op_code[4]` selects the multiply/divide block, `op_code[2]`
+chooses divide over multiply, and `op_code[1:0]` select operand signedness
+for both units (`rtl/risc.v:119-125`).
+
+[[controller-fsm]]
+=== Controller Finite State Machine
+
+The controller is a Moore machine with seven states, encoded in three bits.
+The state register updates once per clock; every control output is a
+combinational function of `present_state` and `instr` (Mealy-style outputs
+on a Moore-style state register).
+
+[cols="1,1,5", options="header"]
+.FSM States (`rtl/risc.v:190-196`)
+|===
+| State | Encoding | Purpose
+| `fetch`         | `000` | Instruction word is presented on `instr` (combinational read from `instruction_mem`).
+| `decode`        | `001` | `ALUOP`/`IRMUX` become valid; register-address/immediate fields latch into `instruction_dec`'s output registers on this state's clock edge.
+| `read_src_regs` | `010` | `rs1`/`rs2` are read (asynchronous read, so this state exists to let the just-latched addresses settle before `execute` uses them).
+| `execute`       | `011` | The ALU (or, for AUIPC, the dedicated `pc + immU` adder in the write-back mux) produces its result.
+| `rw_data_mem`   | `100` | Data memory is read or written, only entered by Load/Store.
+| `write_back`    | `101` | `WERF` is asserted and the selected `WD` value is written into the register file.
+| `call_nxt_pc`   | `110` | `PCMUX` is evaluated and the program counter updates for the *next* fetch.
+|===
+
+State transitions are opcode-dependent, so different instruction classes
+take different numbers of cycles to retire. `decode`'s `else` branch (any
+opcode not explicitly listed) returns to `fetch` rather than advancing —
+this is the mechanism behind both the intentional halt-loop convention used
+by every test/example program (`halt: jal x0, halt` — a JAL back to its own
+address, decoded and re-executed as a jump to itself) and the *unintentional*
+halt on any truly unrecognized opcode, including `ecall`/`ebreak`
+(<<ecall-ebreak-behavior>>).
+
+[cols="3,1,6", options="header"]
+.Per-Instruction-Class State Sequence and Cycle Count
+|===
+| Instruction Class | Cycles | State Sequence
+
+| LUI, JAL                              | 4 | `fetch` → `decode` → `write_back` → `call_nxt_pc`
+| AUIPC                                 | 5 | `fetch` → `decode` → `execute` → `write_back` → `call_nxt_pc`
+| Branch (taken or not)                 | 5 | `fetch` → `decode` → `read_src_regs` → `execute` → `call_nxt_pc`
+| R-type, I-type ALU op, JALR           | 6 | `fetch` → `decode` → `read_src_regs` → `execute` → `write_back` → `call_nxt_pc`
+| Store                                 | 6 | `fetch` → `decode` → `read_src_regs` → `execute` → `rw_data_mem` → `call_nxt_pc`
+| Load                                  | 7 | `fetch` → `decode` → `read_src_regs` → `execute` → `rw_data_mem` → `write_back` → `call_nxt_pc`
+|===
+
+RV32M instructions (`mul`/`div`/etc.) share the R-type opcode and therefore
+the 6-cycle path above; the multiply and divide *algorithms* themselves
+(<<booth-algorithm>>, <<nrd-algorithm>>) are implemented as fully
+combinational, spatially-unrolled logic (`always @(*)` blocks with
+statically-bounded `for` loops), so they add no additional FSM states or
+clock cycles — their entire iterative structure resolves within the single
+`execute` state, at the cost of a correspondingly large combinational depth
+(relevant to the synthesis timing results in <<physical-design-flow>>).
+
+[[jalr-latch]]
+=== JALR Target Latch
+
+`Jump_target` (`rs1 + immI`, computed combinationally in the ALU) is
+asynchronous, read live off the register file. `prgm_cntr` samples it only
+at the `call_nxt_pc → fetch` edge, but the JALR link value (`rd = pc + 4`)
+is written one edge earlier, at `write_back → call_nxt_pc`. When
+`rd == rs1` — a JALR that overwrites its own base register — that register
+write lands first, so by the time `call_nxt_pc` needs `Jump_target`, the
+asynchronous `rs1` read already reflects the *overwritten* value, corrupting
+the jump target.
+
+The fix, present in the current RTL, is a one-cycle latch,
+`JT_latched <= Jump_target` on every clock edge (`rtl/risc.v:43-44`).
+Because `write_back` unconditionally precedes `call_nxt_pc` for every
+instruction in this FSM, the latched copy always holds the value that was
+live *during* `write_back` — i.e. before the conflicting register write —
+by the time `call_nxt_pc` consumes it. `prgm_cntr` only ever sees
+`JT_latched[31:1]`, with bit 0 supplied as a hardwired `1'b0` when
+reconstituting the target address (`pc <= {JT, 1'b0}`), which is the
+RISC-V-mandated clearing of the least-significant bit of a JALR target.
+
+[[instruction-decoder]]
+=== Instruction Decoder
+
+`instruction_dec` has two independent halves:
+
+* **`ALUOP` decode** is purely combinational (`always @(*)`), driven by
+  `opcode`/`funct3`/`funct7`, per the encodings in <<alu-opcodes>>.
+* **Operand/immediate latching** is synchronous (`always @(posedge
+  dec_clk)`), capturing `rs1`/`rs2`/`rd` addresses and the raw immediate
+  sub-fields (`imm_bus`, a 12-bit bus reused across I/S/B formats, and
+  `imm_bus_UJ`, a 20-bit bus reused across U/J formats) on the `decode`
+  state's clock edge. Register fields that a given instruction format does
+  not use are explicitly driven to `5'd0` (never left floating/undriven),
+  so an unused register-file read port can never be indexed with an
+  unknown address.
+
+[[immediate-generation]]
+=== Immediate Generator
+
+`imm_gen` sign-extends each format's immediate to 32 bits. All five outputs
+default to zero and only the format matching the current opcode is
+overwritten, so an instruction that does not use a given immediate form
+drives that output to a defined `0` rather than leaving it undriven.
+
+[cols="1,2,5", options="header"]
+.Immediate Formats
+|===
+| Immediate | Opcodes | Construction
+| `IMM_I` | I-type ALU, Load, JALR (`001_0011`, `000_0011`, `110_0111`) | `SXT(imm[11:0])`
+| `IMM_S` | Store (`010_0011`)     | `SXT(imm[11:0])`, assembled from `{instr[31:25], instr[11:7]}`
+| `IMM_B` | Branch (`110_0011`)   | `SXT({imm[12:1], 1'b0})`, assembled from `{instr[31], instr[7], instr[30:25], instr[11:8]}`
+| `IMM_J` | JAL (`110_1111`)      | `SXT({imm[20:1], 1'b0})`, assembled from `{instr[31], instr[19:12], instr[20], instr[30:21]}`
+| `IMM_U` | LUI, AUIPC (`011_0111`, `001_0111`) | `{imm[31:12], 12'b0}`
+|===
+
+=== Register File
+
+32×32-bit array, `x0` hardwired to zero by construction: writes to address
+`0` are simply never committed (`rtl/risc.v:679`, `if (write_enb &&
+write_addr != 5'd0)`), rather than by special-casing reads — an approach
+chosen specifically because it is synthesizable, unlike gating the read path
+on `mem[0]`. Reads are asynchronous (`rs1`/`rs2` combinationally follow
+`read_addr1`/`read_addr2`); writes are synchronous, qualified by `WERF`, and
+occur only during `write_back`.
+
+[[data-memory]]
+=== Data Memory and Load/Store Alignment
+
+`data_mem` is 64 words (256 bytes), word-indexed by `addr[7:2]` — the low
+two bits of the byte address are dropped, and per-byte write strobes
+(`wstrb[3:0]`) allow `SB`/`SH` to update part of a word without disturbing
+the neighboring bytes. The read port is combinational (a registered read
+would arrive one cycle too late for `write_back` to consume it).
+
+`lsu_align` sits between the raw word-oriented memory and the byte-addressed
+ISA:
+
+* **Store path**: `rs2` is replicated across all four byte lanes
+  (`{4{rs2[7:0]}}` for `SB`, `{2{rs2[15:0]}}` for `SH`, `rs2` unmodified for
+  `SW`), and the strobe pattern (`4'b0001`, `4'b0011`, or `4'b1111`,
+  left-shifted by `addr[1:0]`) selects which lane(s) actually get written —
+  no store-side shifter is needed.
+* **Load path**: the addressed byte or half-word is extracted from the raw
+  memory word using `addr[1:0]`, then sign-extended (`LB`, `LH`) or
+  zero-extended (`LBU`, `LHU`) to 32 bits per `funct3[2]`.
+
+CAUTION: There is no trap/CSR mechanism, so the core cannot raise the
+address-misaligned exception the RISC-V spec permits for a `LH`/`SH` on an
+odd address or a `LW`/`SW` not aligned to a multiple of 4. Behavior on a
+misaligned access is defined only for the aligned case; a misaligned access
+neither traps nor produces a value spanning two words — it silently accesses
+whichever single word the address's upper bits select.
+
+[[instruction-memory]]
+=== Instruction Memory
+
+`instruction_mem` is 256 words (1&#160;KiB of instruction space), word-indexed
+by `pc[9:2]`. Its read port is combinational, since the FSM requires `instr`
+to be valid throughout `fetch` and every decode-time signal derives from it.
+
+Programs are loaded through a dedicated streaming port rather than
+`$readmemh` or a memory-mapped bus: holding `reset` high while pulsing
+`imem_load_en` writes one word per clock at an internally auto-incrementing
+pointer (`wr_ptr`), so a testbench needs no address bookkeeping — it simply
+streams the program in order. `reset` clears only the write pointer, not the
+memory contents, so the core can be reset and re-run without reloading the
+program. This is exactly how `tb/risc_tb_asm.v` loads an assembled program
+before releasing reset and letting the core run (see <<verification>>).
+
+=== Program Counter
+
+`prgm_cntr` is a single 32-bit register updated once per clock, driven by
+`PCMUX` (<<control-signals>>). Every state other than `call_nxt_pc` holds the
+PC unchanged — in particular, JAL/JALR must **not** advance the PC during
+`write_back`, since `write_back` still needs the *current* `pc` to form both
+the `pc + 4` link value and the base for `call_nxt_pc`'s `pc + immJ` /
+`{JT, 1'b0}` computation.
+
+Note that `pc + 4`, `pc + immB`, and `pc + immJ` are all formed with plain
+Verilog `+` operators local to `risc_v`/`prgm_cntr` — **not** through the
+`carry_look_ahead` module. Only the ALU's own ADD/SUB path (R-type/I-type
+add/sub, Load/Store address calculation, and the JALR target `rs1 + immI`)
+routes through the hand-built carry-lookahead adder described in
+<<cla-algorithm>>; PC-relative and link-address arithmetic elsewhere in the
+design is left to the synthesis tool's default adder inference.
+
+== Arithmetic Unit Algorithms
+
+The three functional units below are each an independent, from-first-
+principles hardware algorithm rather than an inferred `+`/`*`//` operator,
+and are each cross-checked in verification against a behavioral model that
+uses the simulator's native operators instead (see <<verification>>) — a
+disagreement between the two is architecturally meaningful, because the two
+implementations cannot share a common arithmetic mistake.
+
+[[cla-algorithm]]
+=== Carry-Lookahead Adder / Subtractor
+
+==== Motivation
+
+A naive ripple-carry adder's critical path grows linearly with operand
+width, because bit `i`'s carry-out cannot be computed until bit `i-1`'s
+carry-out is known. A carry-lookahead adder (CLA) breaks this dependency by
+computing every carry directly from the two input operands and the initial
+carry-in, in terms of two per-bit signals:
+
+[cols="1,3", options="header"]
+|===
+| Signal | Definition
+| Generate, `G(i)`  | `G(i) = A(i) AND B(i)` — a carry is produced at bit `i` regardless of any incoming carry.
+| Propagate, `P(i)` | `P(i) = A(i) XOR B(i)` — an incoming carry at bit `i` is passed through to bit `i+1`.
+|===
+
+==== Carry Recurrence and Closed Form
+
+The carry into bit `i+1` is `C(i+1) = G(i) OR (P(i) AND C(i))`. Expanding
+this recurrence for a 4-bit slice gives each carry purely in terms of the
+primary inputs and the initial carry-in `C0`, with no dependency on any
+intermediate carry:
+
+[subs="+quotes"]
+....
+C1 = G0 + P0.C0
+C2 = G1 + P1.G0 + P1.P0.C0
+C3 = G2 + P2.G1 + P2.P1.G0 + P2.P1.P0.C0
+C4 = G3 + P3.G2 + P3.P2.G1 + P3.P2.P1.G0 + P3.P2.P1.P0.C0
+....
+
+Each `C(i)` is a two-level AND-OR expression of `G`, `P`, and `C0` alone, so
+every carry bit can be evaluated in parallel — the defining advantage over
+ripple-carry propagation. The sum bit itself is then `S(i) = P(i) XOR C(i)`.
+
+==== Subtraction via Two's Complement
+
+A single CLA is reused for both addition and subtraction by conditionally
+inverting the second operand and injecting the resulting `+1` through the
+carry-in, using the identity `A - B = A + NOT(B) + 1`:
+
+* `cin = 0`: operand B passes through unmodified → `result = A + B`.
+* `cin = 1`: each bit of B is XORed with `cin` (`rtl/risc.v:761`,
+  `B[k] = b[k] ^ cin`), inverting it, and the `+1` enters as the adder's
+  carry-in → `result = A + NOT(B) + 1 = A - B`.
+
+==== Implementation Notes
+
+`carry_look_ahead` (`rtl/risc.v:747-782`) is a direct, bit-exact expression
+of the equations above: three nested nested `for` loops inside a single
+`always @(*)` block compute, respectively, the per-bit `P`/`G` (and the
+inverted-`B` term for subtraction), the full 32-bit carry vector `c_o[31:0]`
+by direct expansion of the recurrence (an explicit generalization of the
+`C1`–`C4` expressions above to 32 bits, not a chain of narrower lookahead
+blocks with block-carry generation), and finally the sum bits themselves.
+This module is the sole adder/subtractor instantiated by the ALU, used for
+R-type ADD/SUB, I-type ADD, Load/Store effective-address calculation, and
+the JALR target (`rs1 + immI`) — see the note at the end of
+<<data-memory>> regarding where plain `+` is used instead.
+
+[[booth-algorithm]]
+=== Booth's Multiplier (Radix-2)
+
+==== Motivation
+
+A schoolbook shift-and-add multiplier performs one addition per multiplier
+bit. Booth's algorithm reduces the number of additions/subtractions needed
+when the multiplier contains long runs of consecutive `1` bits, by
+rewriting such a run as a single subtraction at its bottom and a single
+addition just past its top — for example, the run `0111` (which naively
+costs three additions of the shifted multiplicand) is rewritten as
+`1000 - 0001`, one subtraction and one addition.
+
+==== Recoding Rule
+
+Booth's algorithm examines each multiplier bit `Q(i)` together with the bit
+immediately below it, `Q(i-1)` (defined as `0` for the first, least
+significant, step), and recodes the pair into an operation on the
+multiplicand `M`:
+
+[cols="1,1,3", options="header"]
+.Radix-2 Booth Recoding
+|===
+| `Q(i)` | `Q(i-1)` | Operation
+| 0 | 0 | No operation (interior of a run of `0`s)
+| 0 | 1 | `+M` (bottom of a run of `1`s, i.e. the end of the run when scanning LSB→MSB)
+| 1 | 0 | `-M` (top of a run of `1`s, i.e. the start of the run when scanning LSB→MSB)
+| 1 | 1 | No operation (interior of a run of `1`s)
+|===
+
+Each partial product (`+M`, `-M`, or `0`) is added into an accumulator after
+being shifted left by the current bit position `i`, exactly as in ordinary
+shift-and-add multiplication — Booth recoding only changes *which* multiple
+of `M` (`+M`, `-M`, or `0`) is added at each step, not the shift-and-add
+structure itself.
+
+==== Application to All Four RV32M Signedness Combinations
+
+RV32M requires four multiply variants that differ only in how the two
+64-bit-wide operands are formed from the 32-bit inputs: `MUL`/`MULH` treat
+both `rs1` and `rs2` as signed; `MULHSU` treats `rs1` as signed and `rs2` as
+unsigned; `MULHU` treats both as unsigned. `Booths_mult`
+(`rtl/risc.v:798-834`) handles all four with one recoding datapath by first
+widening *both* operands to 33 bits, extending each one with either its own
+sign bit or a `0`, selected independently per operand by the `a_signed` /
+`b_signed` inputs the ALU derives from the instruction's `funct3`
+(`rtl/risc.v:819-820`):
+
+....
+m_ext = { a_signed & M[31], M }   // 33-bit multiplicand
+q_ext = { b_signed & Q[31], Q, 1'b0 }  // 33-bit multiplier, plus the implicit Q(-1)=0
+....
+
+The trailing `1'b0` appended to `q_ext` is the classical Booth "phantom"
+bit, `Q(-1)`, which supplies the `Q(i-1)=0` initial condition for the very
+first recoding step without any special-cased first iteration. Because both
+operands are widened to 33 bits *before* recoding, the resulting 33×33
+signed product is exact in 64 bits regardless of which of the four
+signedness combinations was requested — the recoding loop itself is always
+plain signed Booth multiplication over the widened operands. The loop runs
+33 times (`i = 0` to `32`, one per bit of the widened multiplier),
+accumulating into a 64-bit register:
+
+....
+for i in 0..32:
+    case {q_ext[i+1], q_ext[i]}
+        2'b01: acc = acc + (pp << i)   // +M
+        2'b10: acc = acc - (pp << i)   // -M
+        default: acc = acc             // 00 or 11: no-op
+....
+
+where `pp` is the multiplicand (`m_ext`) sign-extended to the full 64-bit
+accumulator width. The low 32 bits of the final `acc` are the `MUL` result;
+the high 32 bits are `MULH`/`MULHSU`/`MULHU`, selected purely by which
+instruction requested the result (the multiplier hardware itself is
+oblivious to which half the caller wants).
+
+[[nrd-algorithm]]
+=== Non-Restoring Division
+
+==== Motivation
+
+The straightforward ("restoring") division algorithm subtracts the divisor
+from a running partial remainder at every step and, if the result went
+negative, performs an extra addition to *restore* the remainder before
+proceeding to the next bit. Non-restoring division removes that extra
+restore step from the common path: instead of undoing a negative result
+immediately, it lets the partial remainder stay negative and compensates by
+*adding* the (successively halved, effectively) divisor on the following
+step instead of subtracting. Every iteration then costs exactly one
+add-or-subtract, with the choice made purely by inspecting the current
+sign of the running remainder, and only a single, optional correction is
+needed at the very end.
+
+==== Algorithm (Unsigned Magnitudes)
+
+Given an `n`-bit dividend and divisor, using an `n`-bit remainder register
+`A` (initially `0`), an `n`-bit quotient/dividend register `Q` (initially
+the dividend), and the divisor `M`:
+
+. Shift the concatenated `{A, Q}` pair left by one bit.
+. Inspect the sign bit of `A`:
+  * If `A >= 0` (sign bit `0`): `A = A - M`.
+  * If `A < 0` (sign bit `1`): `A = A + M`.
+. Set the new quotient bit, `Q(0)`, from the sign of the *result* of step 2:
+  `Q(0) = 1` if `A >= 0`, `Q(0) = 0` if `A < 0`.
+. Repeat steps 1–3 a total of `n` times (once per output bit).
+. **Final correction**: if `A` is still negative after the last iteration,
+  perform one last restoring addition, `A = A + M`, to obtain the true,
+  non-negative remainder.
+. `Q` now holds the quotient; `A` holds the remainder.
+
+==== Implementation
+
+`non_rest_div` (`rtl/risc.v:851-908`) implements exactly this algorithm,
+with two adaptations for RV32M:
+
+* **Sign handling**: RV32I/M division is signed by default (`DIV`/`REM`)
+  with dedicated unsigned forms (`DIVU`/`REMU`). Rather than build a signed
+  non-restoring loop, the module converts both operands to their unsigned
+  *magnitudes* first (`dvd_mag`, `dvr_mag`, using two's-complement negation
+  when the signed input's sign bit is set and the operation is signed),
+  runs the unsigned algorithm above on the magnitudes, and re-applies the
+  correct sign to the quotient and remainder afterward:
++
+....
+quotient sign  = sign(dividend) XOR sign(divisor)
+remainder sign = sign(dividend)      // RV32M: remainder always follows the dividend
+....
+* **Shift-register width**: the accumulator is 34 bits wide
+  (`{acc, q}` as a combined 34+32-bit shift register, `rtl/risc.v:857`,
+  `892`), two bits wider than the 32-bit operands, specifically so the
+  running remainder's sign bit (`acc[33]`) is always unambiguous at every
+  step of the left-shift-and-subtract sequence, without special-casing
+  overflow into the sign position.
+
+==== Special Cases
+
+The two RV32M special cases in <<div-rem-special-cases>> are handled as
+follows:
+
+* **Division by zero** is detected before the loop runs at all
+  (`rtl/risc.v:875-879`) and short-circuits directly to the spec-mandated
+  results (`Q = 0xFFFFFFFF`, `R = ` the dividend) — the non-restoring loop
+  never executes in this case.
+* **Signed overflow** (`INT_MIN / -1`, i.e. `-2^31 / -1`) requires *no*
+  special case at all: it falls out of the magnitude-based algorithm
+  correctly on its own. `|-2^31|` is exactly representable in 32 bits as
+  `0x80000000`; dividing that magnitude by `|-1| = 1` yields
+  `0x80000000` unchanged, and the sign rule (`neg XOR neg = positive`)
+  leaves it unnegated — which is exactly the spec-mandated overflow result
+  `Q = -2^31` reinterpreted as the same bit pattern, `0x80000000`.
+
+== Memory Organization
+
+The processor is **Harvard-architecture**: instruction and data memory are
+two entirely separate address spaces, each zero-based, with no aliasing or
+shared addressing between them.
+
+[cols="2,2,2,3", options="header"]
+|===
+| Memory | Size | Addressing | Notes
+
+| Instruction memory (`instruction_mem`) | 256×32-bit words (1&#160;KiB) | Byte address `pc`, word-indexed by `pc[9:2]` | Combinational read; loaded via the streaming port described in <<instruction-memory>>. A program larger than 256 instructions does not fit.
+| Data memory (`data_mem`)               | 64×32-bit words (256 bytes)   | Byte address (`rs1 + immI`/`immS`), word-indexed by `addr[7:2]` | Combinational read, synchronous per-byte write. Address bits above `addr[7:0]` are unused (don't-care) for indexing purposes — an address with set bits above bit 7 silently aliases onto the corresponding low-order word, since only `addr[7:2]` selects the memory row.
+|===
+
+== Verification
+
+[[verification]]
+This design is verified by lockstep comparison against an independently
+authored behavioral golden model (`tb/riscv_ref.v`), which reimplements
+RV32I+RV32M using the simulator's native arithmetic operators (`+`, `-`,
+`*`, `/`, `%`, `>>>`, ...) rather than the structural algorithms in
+<<cla-algorithm>>, <<booth-algorithm>>, and <<nrd-algorithm>>. Because the
+DUT and the golden model reach their results by completely different
+computational routes, any disagreement between them is meaningful evidence
+of a bug rather than the same mistake made twice — this is also why the
+golden model independently re-implements the exact special-case behaviors
+in <<div-rem-special-cases>>, rather than deferring to the DUT for them.
+
+Two complementary test flows exercise this comparison:
+
+* **`tb/risc_tb.v`** — 44 directed instruction batches plus 10 batches of
+  180 pseudo-random instructions each (6,453 instructions total), comparing
+  full architectural state (`pc`, all 32 registers, all of data memory)
+  against the golden model after every single retired instruction. Current
+  status: 0 divergences.
+* **`tb/risc_tb_asm.v`** — assembles and runs real RISC-V assembly programs
+  (`asm/*.s`) through the actual GNU RISC-V toolchain
+  (`riscv64-unknown-elf-gcc -march=rv32im`), loads the resulting machine
+  code through the streaming instruction-memory port, and lockstep-compares
+  the DUT against the same golden model, instruction by instruction, until
+  the program's halt loop is detected. Seven example programs currently
+  cover this path — `fibonacci`, `matrix_mult`, `nested_loops`,
+  `load_store_corners` (sub-word load/store sign-extension and
+  negative-offset corners), `array_sum` (`BLT`/`BGE`/`SLT`-driven loops),
+  `branch_sweep` (all six branch comparators, including the signed-vs-
+  unsigned divergence corners `-1` vs. `1` and `INT_MIN` vs. `INT_MAX`),
+  and `div_overflow` (every <<div-rem-special-cases>> case exercised through
+  real `div`/`divu`/`rem`/`remu` instructions) — all passing with 0
+  divergences.
+
+Both flows are invoked through `sim/Makefile` (`make run` and `make run_asm
+PROG=<name>`, respectively) and are designed to exit non-zero on any
+divergence, so they are usable as regression gates.
+
+[[physical-design-flow]]
+== Build, Simulation, and Physical Design Flow
+
+All flows below are driven from `sim/Makefile`; run `make help` for the
+authoritative, up-to-date target list.
+
+[cols="2,5", options="header"]
+.Makefile Targets
+|===
+| Target | Purpose
+
+| `make run` (default `make`)        | Compiles (Icarus Verilog) and runs the full self-checking directed+random testbench.
+| `make run_asm PROG=<name>`         | Assembles `asm/<name>.s` with the RISC-V GNU toolchain, streams the result into the core, and lockstep-verifies against the golden model.
+| `make wave`                        | Runs (if needed) and opens the simulation waveform in GTKWave.
+| `make lint`                        | Vivado RTL elaboration (`synth_design -rtl`) plus `report_methodology`, replacing an earlier Verilator-based lint pass. Requires Vivado on `PATH` (see the Makefile's `VENV_ACTIVATE`/`VIVADO_SETTINGS` variables).
+| `make synth`                       | Synthesizes `rtl/risc.v` with Yosys against the SiliconScholar/Nangate45 typical-corner standard-cell library, producing a gate-level netlist and an area report.
+| `make sta CLK_PERIOD=<ns>`         | Runs OpenSTA static timing analysis (setup/hold, worst/total negative slack, and a static power estimate) against the synthesized netlist.
+| `make clean`                       | Removes all generated build artifacts, including synthesis/lint logs and reports.
+|===
+
+[cols="2,4", options="header"]
+.Toolchain
+|===
+| Stage | Tool
+| RTL simulation           | Icarus Verilog (`iverilog`/`vvp`) + GTKWave for waveform viewing.
+| Assembly toolchain       | `riscv64-unknown-elf-{gcc,as,ld,objcopy,objdump}`, targeting `-march=rv32im -mabi=ilp32`, `-nostdlib -nostartfiles` (no runtime/OS assumptions the core cannot support).
+| RTL lint                 | Xilinx Vivado (RTL elaboration + `report_methodology`).
+| Logic synthesis          | Yosys, targeting a Nangate45 (45&#160;nm) open-cell standard-cell library.
+| Static timing analysis   | OpenSTA, driven from the Yosys-produced gate-level netlist and the same Nangate45 liberty file.
+|===
+
+Synthesis note: `non_rest_div` and `carry_look_ahead`'s nested, statically-
+unrolled combinational structure (see <<controller-fsm>> and
+<<cla-algorithm>>) produces an arithmetic-dense, XOR-heavy boolean network
+that is significantly more expensive for ABC's logic-optimization passes to
+process than a comparably-sized but more regular datapath would be; `make
+synth` defaults to ABC's `-fast` mode for this reason (see the `ABC_FAST`
+Makefile variable).
+
+== Known Limitations
+
+* **No trap or CSR infrastructure.** There are no exception/interrupt
+  vectors, no privilege levels, and no CSR file. `ecall`/`ebreak` are
+  encoded but inert (<<ecall-ebreak-behavior>>); an illegal or otherwise
+  unrecognized opcode halts the fetch/decode loop in place rather than
+  faulting.
+* **No `fence`/`fence.i`.** Not required for correctness given the design
+  has no cache hierarchy or memory reordering to fence against, but the
+  opcode is unrecognized rather than accepted as a no-op.
+* **Misaligned memory accesses are undefined**, not trapped
+  (<<data-memory>>).
+* **Small, fixed memory footprint.** 1&#160;KiB of instruction space (256
+  words) and 256 bytes of data space (64 words); neither is
+  runtime-configurable without changing the `DEPTH` parameters in
+  `instruction_mem`/`data_mem` and resynthesizing.
+* **Single-issue, multi-cycle, no pipelining.** Throughput is bounded below
+  by the cycle counts in <<controller-fsm>> (4–7 cycles per instruction);
+  there is no forwarding, hazard detection, or branch prediction because
+  there is no pipeline for hazards to occur in.
+* **RV32M arithmetic is combinationally unrolled**, trading synthesized
+  area and combinational depth for single-cycle latency within `execute`
+  (<<physical-design-flow>>).
+
+[[references]]
+== References
+
+* RISC-V unprivileged ISA specification — the normative definition of every
+  instruction's encoding and semantics referenced throughout this document.
+* Maven Silicon, _RISC-V RV32I Reference_ (`docs/RISC-V_RV32I_Quick_Reference_Guide.pdf`)
+  — the instruction-table organization (`Inst | Name | FMT | Opcode |
+  funct3 | funct7 | Description | Note`) that <<instruction-formats>>
+  through the RV32M table in this document deliberately mirror.
+* Generate/propagate carry equations and the two's-complement subtraction
+  identity (<<cla-algorithm>>): https://www.electronicshub.org/carry-look-ahead-adder/[Carry-Lookahead Adder — Electronics Hub].
+* Radix-2 Booth recoding rule (<<booth-algorithm>>): https://digitalsystemdesign.in/booths-multiplication-algorithm/[Booth's Multiplication Algorithm — Digital System Design].
+* Non-restoring division algorithm steps (<<nrd-algorithm>>): https://www.geeksforgeeks.org/non-restoring-division-unsigned-integer/[Non-Restoring Division for Unsigned Integers — GeeksforGeeks].
