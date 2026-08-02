@@ -7,19 +7,23 @@
 #   max = 100         (BLT-based running max)
 #   neg_count = 4      (SLT rd,val,0 -> 1 iff val<0, then branch on rd)
 #
-# mem[0]=sum, mem[4]=max, mem[8]=neg_count.
+# mem[0]=sum, mem[4]=max, mem[8]=neg_count, where "mem[k]" is the dmem word
+# DATA_BASE+k aliases onto (see core_defs.inc).
 #
-# run: make run_asm PROG=array_sum   (from RISC-V-Processor/sim)
-.text
-.globl _start
-_start:
-    addi x1, x0, 8            # N
-    addi x2, x0, 0             # i = 0
-    addi x3, x0, 32             # array base address
-    addi x4, x3, 0                # addr = base, walks by +4
-    addi x5, x0, 0                 # sum
-    lui  x10, 0x80000                # max = INT_MIN (running max seed)
-    addi x11, x0, 0                   # neg_count
+# run: make run_asm  PROG=array_sum   (core vs riscv_ref.v)
+#      make run_qemu PROG=array_sum   (core vs riscv_ref.v AND qemu-riscv32)
+#include "core_defs.inc"
+
+    CORE_DATA_REGION
+    CORE_ENTRY
+
+    addi x1, x0, 8               # N
+    addi x2, x0, 0                # i = 0
+    addi x3, DATA_REG, 32          # array base address
+    addi x4, x3, 0                  # addr = base, walks by +4
+    addi x5, x0, 0                   # sum
+    lui  x10, 0x80000                 # max = INT_MIN (running max seed)
+    addi x11, x0, 0                    # neg_count
 
     # ---- populate the array ----
     addi x6, x0, 5
@@ -60,9 +64,8 @@ after_neg:
     jal  x0, sum_loop
 
 sum_done:
-    sw   x5,  0(x0)      # sum
-    sw   x10, 4(x0)      # max
-    sw   x11, 8(x0)      # neg_count
+    sw   x5,  0(DATA_REG)      # sum
+    sw   x10, 4(DATA_REG)      # max
+    sw   x11, 8(DATA_REG)      # neg_count
 
-halt:
-    jal x0, halt
+    CORE_HALT

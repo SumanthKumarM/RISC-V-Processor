@@ -22,6 +22,9 @@ module risc_v(
     input imem_load_en,
     input [31:0] imem_load_data);
 
+    // parameter that decides the depth of the instruction memory
+    parameter DEPTH = 256;  // instruction words
+
     reg [31:0] WD;  // write-back data
     wire [31:0] immI,immB,immJ,immS,immU,rs1,rs2;
     wire [11:0] imm_bus;
@@ -70,12 +73,12 @@ module risc_v(
 
     // instantiating other modules
     prgm_cntr program_counter(pc, immB, immJ, JT_latched[31:1], PCMUX, BJ_sel, clock, reset);
-    instruction_mem instruction_memory(instr, pc, clock, reset, imem_load_en, imem_load_data);
+    instruction_mem#(DEPTH) instruction_memory(instr, pc[$clog2(DEPTH)+1:2], clock, reset, imem_load_en, imem_load_data);
     instruction_dec instruction_decoder(dec_aluop, imm_bus, imm_bus_UJ, RS1_addr, RS2_addr, RD_addr, instr, clock);
     reg_file register_file(rs1, rs2, reset, clock, WERF, WD, RD_addr, RS1_addr, RS2_addr);
     ALU alu(ALUOUT, Jump_target, Branch_target, rs1, rs2, immS, immI, instr[6:0], IRMUX, ALUOP);
     controller FSM(ALUOP, WERF, MWR, BJ_sel, IRMUX, PCMUX, WBMUX, dec_aluop, instr[6:0], instr[12], clock, reset, Branch_target);
-    data_mem data_memory(data_mem_out, reset, clock, dmem_wstrb, ALUOUT, store_data);
+    data_mem data_memory(data_mem_out, reset, clock, dmem_wstrb, ALUOUT[7:2], store_data);
     imm_gen immediate_generator(immB, immJ, immI, immS, immU, imm_bus, imm_bus_UJ, instr[6:0]);
     // data_mem_out is the raw 32-bit word at the addressed location; lsu_align
     // turns it into the value a Load actually writes back.
@@ -510,16 +513,13 @@ module data_mem(
     output [31:0] data_out,
     input data_mem_rst, data_mem_clk,
     input [3:0] wstrb,  // per-byte write strobes; 4'b0000 --> read only
-    input [31:0] addr,  // byte address (from the ALU)
+    input [5:0] word_addr,  // byte address (from the ALU)
     input [31:0] data_in);
 
     parameter DEPTH = 64;
 
     reg [31:0] mem[DEPTH-1:0];
     integer i;
-
-    // addr is a byte address; drop the two low bits to index words.
-    wire [5:0] word_addr = addr[7:2];
 
     assign data_out = mem[word_addr];
 
@@ -629,28 +629,25 @@ endmodule
    The read port is combinational: the FSM expects 'instr' to be valid during
    'fetch', and every decode-time control signal derives from it.
 **/
-module instruction_mem(
+module instruction_mem #(parameter DEPTH = 256)(
     output [31:0] instruction,
-    input [31:0] addr,  // byte address (from the PC)
+    input [$clog2(DEPTH)-1:0] addr,  // byte address (from the PC)
     input clk,
     input rst,  // resets the load pointer
     input load_en,
     input [31:0] load_data);
 
-    parameter DEPTH = 256;  // instruction words
-    parameter PTRW = 8;  // log2(DEPTH)
-
     reg [31:0] mem[DEPTH-1:0];
-    reg [PTRW-1:0] wr_ptr;
+    reg [$clog2(DEPTH)-1:0] wr_ptr;
 
-    assign instruction = mem[addr[PTRW+1:2]]; // byte address -> word index
+    assign instruction = mem[addr]; // byte address -> word index
 
     always@(posedge clk) begin
         if(load_en) begin
             mem[wr_ptr] <= load_data;
             wr_ptr <= wr_ptr + 1;
         end
-        else if(rst) wr_ptr <= {PTRW{1'b0}};
+        else if(rst) wr_ptr <= {$clog2(DEPTH){1'b0}};
         else begin
             mem[wr_ptr] <= mem[wr_ptr];
             wr_ptr <= wr_ptr;
@@ -749,35 +746,39 @@ module carry_look_ahead(
     input [31:0] a, b,
     input cin);
 
-    reg [31:0] p, g, r, y, c_o, B;
+    reg [31:0] p, y, B;
+    reg [30:0] g, c_o, r;
 
     integer i, j, k;
     always@(*) begin
         for(k=0; k<32; k=k+1) begin
-            // For subtraction cin inverts b; the +1 enters as the carry-in.
-            // NOTE: the operands are used exactly as given. The previous version
-            // swapped them by magnitude when subtracting, which computed |a-b|
-            // instead of a-b whenever a < b.
-            B[k] = b[k]^cin;
-            // carry generate and propagate.
-            p[k] = a[k]^B[k];
-            g[k] = a[k]&B[k];
+            // For subtraction cin inverts b; the +1 enters as the carry-in
+            B[k] = b[k] ^ cin;
+            // carry generate and propagate. p needs the full 32 bits (result[31]
+            // reads p[31] directly), but g only ever feeds c_o[0..30] (result
+            // never needs the 32nd carry, c_o[31] would have been the carry out
+            // of the whole 32-bit add/sub, which RV32I/M has no use for) so it
+            // is written for k=0..30 only - g has no index 31 to write into.
+            p[k] = a[k] ^ B[k];
+            if(k <= 30) g[k] = a[k] & B[k];
         end
-        r = {g[30:0],cin};
+        // r[i] is only ever read for i<=k<=30 below, so r is sized to match
+        // (30 bits of g plus cin, not the full 31-bit g).
+        r = {g[29:0], cin};
         // Logic for carry generator.
-        for(k=0; k<=31; k=k+1) begin
+        for(k=0; k<=30; k=k+1) begin
             c_o[k] = g[k];
             for(i=0; i<=k; i=i+1) begin
                 y[i] = r[i];
                 for( j=i; j<=k; j=j+1) begin
-                    y[i] = y[i]&p[j];
+                    y[i] = y[i] & p[j];
                 end
-                c_o[k] = c_o[k]|y[i];
+                c_o[k] = c_o[k] | y[i];
             end
         end
         // iteration for sum signal.
-        result[0] = p[0]^cin;
-        for(k=1; k<32; k=k+1) result[k] = p[k]^c_o[k-1];
+        result[0] = p[0] ^ cin;
+        for(k=1; k<32; k=k+1) result[k] = p[k] ^ c_o[k-1];
     end
 endmodule
 

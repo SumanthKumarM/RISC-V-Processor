@@ -831,6 +831,8 @@ shared addressing between them.
 == Verification
 
 [[verification]]
+=== Golden-Model Lockstep Comparison
+
 This design is verified by lockstep comparison against an independently
 authored behavioral golden model (`tb/riscv_ref.v`), which reimplements
 RV32I+RV32M using the simulator's native arithmetic operators (`+`, `-`,
@@ -866,7 +868,214 @@ Two complementary test flows exercise this comparison:
 
 Both flows are invoked through `sim/Makefile` (`make run` and `make run_asm
 PROG=<name>`, respectively) and are designed to exit non-zero on any
-divergence, so they are usable as regression gates.
+divergence, so they are usable as regression gates. Both are additionally
+extended with a second, independent oracle — see <<qemu-verification>>.
+
+=== qemu-riscv32 as a Second, Independent Oracle
+
+[[qemu-verification]]
+==== Motivation
+
+Lockstep comparison against `tb/riscv_ref.v` establishes that the DUT and
+the golden model compute identically, but both are implementations authored
+in this repository from a single reading of the RISC-V unprivileged
+specification. Where the two share a misreading of the same corner of the
+spec — divide-by-zero results, the `INT_MIN / -1` overflow case, sub-word
+load sign-extension, or a signed/unsigned comparator pair — they agree with
+each other, and lockstep alone would report a clean pass on a genuinely
+incorrect core.
+
+To close this blind spot, the design is additionally verified against
+`qemu-riscv32`, a mature, independently developed RISC-V user-mode emulator
+with no relationship to this codebase. Agreement between the DUT and qemu
+is therefore meaningful evidence in a way that agreement between two
+same-repository models cannot be. The full implementation of this flow is
+maintained in `qemu/`, with `qemu/README.md` as its detailed design record;
+this section summarizes that design for the reader of this specification.
+
+==== Reconciling a Verilog Simulation with a Linux Process
+
+A hardware simulation and a Linux user-mode process cannot execute
+byte-identical images. Exactly three differences exist between them, and
+each is resolved in one specific place:
+
+[cols="1,3,3,3", options="header"]
+.Differences Between the Core and a qemu-riscv32 User-Mode Process
+|===
+| # | Difference | Why It Exists | Resolution
+
+| 1
+| Data resides at `DATA_BASE` (`0x12000`) under qemu rather than at
+  address `0`.
+| Linux refuses to map page 0 (`vm.mmap_min_addr`), so a store to address 0
+  raises `SIGSEGV` under qemu; the core has no such restriction.
+| `asm/core_defs.inc` defines `DATA_BASE` once, shared by both builds, so
+  `data_mem`'s `addr[7:2]` indexing aliases `DATA_BASE+k` onto exactly the
+  word plain `k` addresses on the core.
+
+| 2
+| Instruction text is linked at `0x10000` for qemu, `0x0` for the core.
+| Same page-0 restriction applies to the text segment.
+| `qemu_trace.py` subtracts the qemu-side `__trace_start` symbol from every
+  traced `pc`, and from any general-purpose register that has become
+  address-relative (see <<qemu-pc-relocation>>).
+
+| 3
+| Entry and exit sequences differ.
+| qemu hands a process a populated stack pointer, while the core resets
+  with an all-zero register file; the core parks in a self-loop at halt,
+  while a qemu process must call `exit()` or run forever.
+| The qemu build zeroes the register file at entry; the `__trace_start`/
+  `__trace_end` symbols bracket the region `qemu_trace.py` extracts,
+  discarding everything outside it.
+|===
+
+Because `DATA_BASE` is identical in both builds, the contents of data
+memory are unaffected by the port — only registers that hold addresses
+carry the `DATA_BASE` offset.
+
+==== Trace Capture
+
+`qemu/trace_plugin.c` is a QEMU TCG plugin, loaded via `-plugin
+trace_plugin.so`. A plugin was chosen over qemu's built-in instruction log
+(`-d cpu`) because that log has no facility for reporting store addresses
+and data — precisely the state this flow most needs to observe — and
+because the plugin API is substantially faster than parsing free-form text
+output.
+
+The plugin emits one line per event, in a raw format that `qemu_trace.py`
+subsequently normalizes:
+
+....
+S <addr> <size> <value>      one line per store, hexadecimal
+I <pc> <r0> <r1> ... <r31>   one line per retired instruction, hexadecimal
+E <count>                    final line, the total retired-instruction count
+....
+
+Ordering is the subtle part: QEMU's instruction-execution callback fires
+*before* the instruction executes, so the register values it reports are
+those left behind by the *previous* instruction, while a store is reported
+*during* the instruction performing it. The plugin therefore buffers
+pending stores and flushes them immediately ahead of the next `I` line, so
+each `I` record together with the `S` records preceding it forms one
+coherent statement: "this instruction has retired; here is the resulting
+register file, and here is the store it performed."
+
+CAUTION: QEMU publishes RISC-V general-purpose register `x8` under the ABI
+name `fp`, not `s0`. `trace_plugin.c` matches every accepted spelling per
+register (`reg_aliases[]`) and treats an unresolved register as a fatal
+error rather than silently reading it as zero — an unresolved register
+would otherwise be invisibly excluded from every comparison, permitting a
+run to pass without ever having checked it.
+
+Per retired instruction, the flow checks `pc`, all 32 general-purpose
+registers, and all 64 data-memory words. Memory state is not inferred from
+later loads: every store recorded in the trace is folded into a shadow
+memory using the same `addr[7:2]` aliasing the core uses, and the result is
+compared word-for-word against `DUT.data_memory`.
+
+==== Verifying Compiled Assembly Programs
+
+Each program under `asm/*.s` is a standalone executable, so it is assembled
+twice from the same source — once at `-Ttext=0x0` for the core, once at
+`-Ttext=0x10000 -DQEMU_BUILD=1` for qemu — traced once under the plugin,
+and `tb/risc_tb_asm.v` then lockstep-compares the DUT against `riscv_ref.v`
+and the qemu trace simultaneously, reporting each oracle's divergences
+independently. This is driven by `make run_qemu PROG=<name>` (see
+<<physical-design-flow>>).
+
+[[qemu-pc-relocation]]
+==== Extending the Oracle to the Directed/Random Suite
+
+The majority of this core's verification — 6,453 instructions across 54
+batches — comes from `tb/risc_tb.v`'s hand-generated directed and
+pseudo-random instruction streams, not from `asm/*.s`. Those batches are
+not standalone programs: each begins from an arbitrary *seeded* register
+file and data memory, deliberately chosen to exercise corner cases
+(`INT_MIN`, wrap-around shift amounts, division by zero) that a compiled
+program would rarely reach by chance. There is consequently no single qemu
+ELF to build once per batch, and the flow instead runs in three passes,
+driven by `make run_tb_qemu`:
+
+. `tb/risc_tb.v` runs once with `+QEMU_DUMP=<dir>`, dumping every batch's
+  program and seed state to `batch_NNN.dump`. This pass performs the
+  ordinary golden-model check exactly as `make run` does; the dump is a
+  side effect.
+. `qemu/tb_batch_gen.py` synthesizes, per batch, a standalone qemu-runnable
+  image whose `_start` reproduces the batch's seeded state by brute force —
+  storing every non-zero seeded data word, then loading every seeded
+  register with a fixed-size `lui`+`addi` pair (deliberately not the
+  size-optimizing `li` pseudo-op, so that prologue length remains
+  deterministic) — followed by the batch's own instructions and an explicit
+  `exit(0)`. `qemu_trace.py` traces the result exactly as it does for
+  `asm/*.s`.
+. `tb/risc_tb.v` runs a second time with `+QEMU_TRACE_DIR=<dir>` and the
+  same random seed, so the identical sequence of batches regenerates in the
+  identical order, and each is compared against both `riscv_ref.v` and its
+  corresponding qemu trace.
+
+Extending the oracle to hand-generated, non-standalone batches surfaced
+three problems specific to this suite, none of which the seven `asm/*.s`
+programs had ever triggered:
+
+. *Address-carrying registers.* A `JAL`/`JALR` link register or an `AUIPC`
+  result captures a raw, qemu-relocated address into a general-purpose
+  register, and the point at which a register becomes address-relative is
+  dynamic — whichever instruction last wrote it. `qemu_trace.py` therefore
+  accepts `--text-reloc-mask` (registers already address-relative in the
+  first record) and `--text-reloc-events` (`offset:register` pairs
+  identifying exactly where a register becomes address-relative);
+  `tb_batch_gen.py` computes these events with a static scan for
+  `JAL`/`JALR`/`AUIPC` instructions targeting a non-`x0` destination.
+. *The load/store base register as an ALU operand.* `test_random`'s operand
+  selection originally admitted `x1` (the suite's dedicated load/store
+  base) as an ordinary `rs1`/`rs2` source. Because non-additive operations
+  (`AND`, `MUL`, ...) do not distribute over the `DATA_BASE` offset carried
+  by a relocated `x1`, the resulting register value cannot be corrected
+  after the fact. The fix was made in the test generator itself: `x1` is
+  now excluded from `rs1`/`rs2` selection in `test_random`, the same way it
+  was already excluded from `rd`.
+. *Exact instruction budget for looping batches.* A batch containing a
+  backward branch with no natural exit (e.g. `test_jumps`'s `jal-backward`
+  case) is bounded only by `risc_tb.v`'s own fixed per-batch instruction
+  count; qemu has no equivalent bound. `tb_batch_gen.py` computes an exact
+  instruction cap — deterministic prologue length plus the batch's traced
+  instruction count plus one — and passes it to the plugin's `max=`
+  argument, so qemu halts at precisely the point the DUT does rather than
+  one loop iteration later.
+
+A further, non-batch-specific detail applies to both flows: because the
+qemu trace only ever records *stores*, the shadow memory reconstructed for
+comparison must be initialized from the same seed as `DUT.data_memory` and
+`REF.dmem`, not from zero — otherwise a word the program never touches
+would read qemu=0 against a non-zero seeded DUT value for the entire run.
+
+==== Confirming the Harness Can Fail
+
+A comparison that never triggers reports zero errors indefinitely, which is
+indistinguishable from a genuinely passing design. Both qemu flows were
+fault-injected to confirm the check is live: a known-good trace record was
+deliberately corrupted (a register value, a `pc`, a store address, or store
+data) and the run repeated. In every case except a store redirected to
+another already-zero word — a semantically invisible mutation — the harness
+reported the corruption precisely, naming the diverging register, program
+counter, or memory word, while `riscv_ref.v` continued to report zero
+errors for the same run. This confirms the qemu-comparison path fires
+independently of, and is not merely riding along with, the golden-model
+check.
+
+==== Coverage Summary
+
+[cols="3,3,2", options="header"]
+.qemu-Oracle Coverage by Test Source
+|===
+| Test Source | Oracle(s) Checked | Makefile Entry Point
+
+| `asm/*.s` (compiled programs)            | `riscv_ref.v` only                    | `make run_asm PROG=<name>` / `run_asm_all`
+| `asm/*.s` (compiled programs)            | `riscv_ref.v` **and** `qemu-riscv32`  | `make run_qemu PROG=<name>` / `run_qemu_all`
+| `tb/risc_tb.v` (directed + random suite) | `riscv_ref.v` only                    | `make run`
+| `tb/risc_tb.v` (directed + random suite) | `riscv_ref.v` **and** `qemu-riscv32`  | `make run_tb_qemu`
+|===
 
 [[physical-design-flow]]
 == Build, Simulation, and Physical Design Flow
@@ -881,6 +1090,11 @@ authoritative, up-to-date target list.
 
 | `make run` (default `make`)        | Compiles (Icarus Verilog) and runs the full self-checking directed+random testbench.
 | `make run_asm PROG=<name>`         | Assembles `asm/<name>.s` with the RISC-V GNU toolchain, streams the result into the core, and lockstep-verifies against the golden model.
+| `make run_asm_all`                 | Runs `run_asm` for every program under `asm/`.
+| `make qemu_plugin`                 | Builds the QEMU TCG trace plugin (`qemu/trace_plugin.so`); a prerequisite of the two targets below.
+| `make run_qemu PROG=<name>`        | As `run_asm`, but additionally checked against a `qemu-riscv32` trace — a second, independent oracle (see <<qemu-verification>>).
+| `make run_qemu_all`                | Runs `run_qemu` for every program under `asm/`.
+| `make run_tb_qemu`                 | Extends the second-oracle check to `tb/risc_tb.v`'s directed/random suite (see <<qemu-verification>>).
 | `make wave`                        | Runs (if needed) and opens the simulation waveform in GTKWave.
 | `make lint`                        | Vivado RTL elaboration (`synth_design -rtl`) plus `report_methodology`, replacing an earlier Verilator-based lint pass. Requires Vivado on `PATH` (see the Makefile's `VENV_ACTIVATE`/`VIVADO_SETTINGS` variables).
 | `make synth`                       | Synthesizes `rtl/risc.v` with Yosys against the SiliconScholar/Nangate45 typical-corner standard-cell library, producing a gate-level netlist and an area report.
@@ -894,6 +1108,7 @@ authoritative, up-to-date target list.
 | Stage | Tool
 | RTL simulation           | Icarus Verilog (`iverilog`/`vvp`) + GTKWave for waveform viewing.
 | Assembly toolchain       | `riscv64-unknown-elf-{gcc,as,ld,objcopy,objdump}`, targeting `-march=rv32im -mabi=ilp32`, `-nostdlib -nostartfiles` (no runtime/OS assumptions the core cannot support).
+| Second-oracle verification | `qemu-riscv32` driven by a custom QEMU TCG plugin (see <<qemu-verification>>).
 | RTL lint                 | Xilinx Vivado (RTL elaboration + `report_methodology`).
 | Logic synthesis          | Yosys, targeting a Nangate45 (45&#160;nm) open-cell standard-cell library.
 | Static timing analysis   | OpenSTA, driven from the Yosys-produced gate-level netlist and the same Nangate45 liberty file.

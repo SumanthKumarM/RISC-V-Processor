@@ -11,6 +11,12 @@
 #   make run_asm PROG=<name>   assemble asm/<name>.s with the RISC-V GNU
 #                               toolchain and run it on the core, lockstep
 #                               against the golden model (see run_asm below)
+#   make run_asm_all           the same for every program under asm/
+#   make run_qemu PROG=<name>  as run_asm, but ALSO checked against a
+#                               qemu-riscv32 trace - a second, independent
+#                               oracle (see the qemu section below)
+#   make run_qemu_all          the same for every program under asm/
+#   make qemu_plugin           build the QEMU TCG trace plugin only
 #   make clean      remove build artefacts
 #
 # Options:
@@ -71,11 +77,36 @@ OBJCOPY := $(TOOLCHAIN_PREFIX)objcopy
 OBJDUMP := $(TOOLCHAIN_PREFIX)objdump
 PYTHON  ?= python3
 
-# -march=rv32im (+no zicsr/zifencei): the core has no CSR/trap/fence
-# infrastructure, so any program that needs them must be rejected at
-# assemble time rather than silently misbehaving in simulation.
-ASFLAGS := -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles \
-           -Wl,-Ttext=0x0 -Wl,--no-relax
+NM      := $(TOOLCHAIN_PREFIX)nm
+
+# Every asm/*.s program is built twice from the same source: once for the core
+# and once for qemu. asm/core_defs.inc holds everything that differs; these
+# flags just select which half of it is active.
+#
+#   -march=rv32im (+no zicsr/zifencei): the core has no CSR/trap/fence
+#       infrastructure, so any program needing them is rejected at assemble
+#       time rather than silently misbehaving in simulation.
+#   -x assembler-with-cpp: core_defs.inc is #included and its macros are
+#       selected with #if, so the sources must go through cpp.
+#   -Tbss=$(DATA_BASE): pins the .bss page that DATA_BASE points at. It must
+#       match DATA_BASE in core_defs.inc or the core and qemu would address
+#       different words; qemu_trace.py is passed --data-base and checks it.
+#   -Ttext: 0x0 for the core (it fetches from 0 after reset) but 0x10000 for
+#       qemu (Linux will not map page 0). qemu_trace.py normalises that offset
+#       away; see its header for why the relocation is safe.
+DATA_BASE  ?= 0x12000
+CORE_TEXT  ?= 0x0
+QEMU_TEXT  ?= 0x10000
+
+ASFLAGS_COMMON := -x assembler-with-cpp -march=rv32im -mabi=ilp32 \
+                  -nostdlib -nostartfiles -I$(ASM_DIR) \
+                  -Wl,-Tbss=$(DATA_BASE) -Wl,--no-relax
+
+ASFLAGS      := $(ASFLAGS_COMMON) -DQEMU_BUILD=0 -Wl,-Ttext=$(CORE_TEXT)
+QEMU_ASFLAGS := $(ASFLAGS_COMMON) -DQEMU_BUILD=1 -Wl,-Ttext=$(QEMU_TEXT)
+
+# Every program under asm/, for the run_asm_all / run_qemu_all sweeps.
+ASM_PROGS := $(sort $(notdir $(basename $(wildcard $(ASM_DIR)/*.s))))
 
 ASM_MEM_DIR := $(BUILD)/asm_build
 ASM_TOP     := risc_tb_asm
@@ -103,6 +134,142 @@ endif
 	@cd $(BUILD) && $(VVP) $(ASM_TOP).vvp +MEMFILE=asm_build/$(PROG).mem 2>&1 | tee asm_build/$(PROG).log
 	@grep -q "^TB_STATUS: PASS$$" $(ASM_MEM_DIR)/$(PROG).log \
 		|| { echo "*** $(PROG): DUT diverged from golden model ***"; exit 1; }
+
+#-----------------------------------------------------------------------------
+# qemu-riscv32 as a second, independent oracle
+#
+#   make qemu_plugin              build the TCG trace plugin
+#   make run_qemu PROG=<name>     run <name> against BOTH riscv_ref.v and qemu
+#   make run_qemu_all             the same for every program under asm/
+#
+# run_asm above checks the core against riscv_ref.v, which is an independent
+# implementation but still one written in this repo from one reading of the
+# spec - so risc.v and riscv_ref.v can agree on a wrong answer and lockstep
+# will report a clean pass. qemu-riscv32 has no such relationship to either,
+# which is the whole point of this target.
+#
+# Flow: asm/<PROG>.s is assembled twice (core image and qemu image, differing
+#       only in the parts of core_defs.inc selected by -DQEMU_BUILD), the qemu
+#       image is executed under the trace plugin, and qemu_trace.py normalises
+#       the result into a per-instruction trace. risc_tb_asm.v then checks the
+#       DUT against riscv_ref.v and that trace simultaneously, reporting each
+#       oracle's divergences separately.
+#-----------------------------------------------------------------------------
+QEMU_DIR      := ../qemu
+QEMU_BIN      ?= /opt/riscv-gnu/riscv/bin/qemu-riscv32
+QEMU_PLUGIN   := $(QEMU_DIR)/trace_plugin.so
+QEMU_TRACE_PY := $(QEMU_DIR)/qemu_trace.py
+
+.PHONY: qemu_plugin
+qemu_plugin:
+	@$(MAKE) --no-print-directory -C $(QEMU_DIR)
+
+.PHONY: run_qemu
+run_qemu: qemu_plugin
+ifndef PROG
+	$(error usage: make run_qemu PROG=<name>  (assembles $(ASM_DIR)/<name>.s))
+endif
+	@test -f $(ASM_DIR)/$(PROG).s || \
+		{ echo "*** $(ASM_DIR)/$(PROG).s not found ***"; exit 1; }
+	@mkdir -p $(ASM_MEM_DIR)
+	@echo "==> [1/3] core image"
+	$(CC) $(ASFLAGS) -o $(ASM_MEM_DIR)/$(PROG).elf $(ASM_DIR)/$(PROG).s
+	$(OBJCOPY) -O binary -j .text $(ASM_MEM_DIR)/$(PROG).elf $(ASM_MEM_DIR)/$(PROG).bin
+	$(OBJDUMP) -d $(ASM_MEM_DIR)/$(PROG).elf > $(ASM_MEM_DIR)/$(PROG).dis
+	$(PYTHON) $(BUILD)/bin2mem.py $(ASM_MEM_DIR)/$(PROG).bin $(ASM_MEM_DIR)/$(PROG).mem
+	@echo "==> [2/3] qemu image + reference trace"
+	$(CC) $(QEMU_ASFLAGS) -o $(ASM_MEM_DIR)/$(PROG).qemu.elf $(ASM_DIR)/$(PROG).s
+	$(OBJDUMP) -d $(ASM_MEM_DIR)/$(PROG).qemu.elf > $(ASM_MEM_DIR)/$(PROG).qemu.dis
+	$(PYTHON) $(QEMU_TRACE_PY) \
+		--elf       $(ASM_MEM_DIR)/$(PROG).qemu.elf \
+		--out       $(ASM_MEM_DIR)/$(PROG).qtrace \
+		--qemu      $(QEMU_BIN) \
+		--plugin    $(QEMU_PLUGIN) \
+		--nm        $(NM) \
+		--data-base $(DATA_BASE)
+	@echo "==> [3/3] lockstep run against both oracles"
+	$(IVERILOG) $(ASM_IVFLAGS) -o $(ASM_OUT) $(ASM_TB_SRCS)
+	@cd $(BUILD) && $(VVP) $(ASM_TOP).vvp \
+		+MEMFILE=asm_build/$(PROG).mem \
+		+QEMUTRACE=asm_build/$(PROG).qtrace 2>&1 | tee asm_build/$(PROG).qemu.log
+	@grep -q "^TB_STATUS: PASS$$" $(ASM_MEM_DIR)/$(PROG).qemu.log \
+		|| { echo "*** $(PROG): DUT diverged - see $(ASM_MEM_DIR)/$(PROG).qemu.log"; \
+		     echo "*** (the summary names which oracle objected) ***"; exit 1; }
+
+# Sweeps. Each program runs in its own sub-make so one failure reports the
+# program that caused it instead of a bare non-zero exit from a shell loop.
+.PHONY: run_asm_all run_qemu_all
+run_asm_all:
+	@for p in $(ASM_PROGS); do \
+		echo "=== run_asm $$p ==="; \
+		$(MAKE) --no-print-directory run_asm PROG=$$p > /dev/null \
+			|| { echo "*** FAILED: $$p ***"; exit 1; }; \
+		echo "    PASS"; \
+	done
+	@echo "all $(words $(ASM_PROGS)) program(s) passed vs riscv_ref.v"
+
+run_qemu_all: qemu_plugin
+	@for p in $(ASM_PROGS); do \
+		echo "=== run_qemu $$p ==="; \
+		$(MAKE) --no-print-directory run_qemu PROG=$$p > /dev/null \
+			|| { echo "*** FAILED: $$p ***"; exit 1; }; \
+		echo "    PASS"; \
+	done
+	@echo "all $(words $(ASM_PROGS)) program(s) passed vs riscv_ref.v AND qemu-riscv32"
+
+#-----------------------------------------------------------------------------
+# qemu-riscv32 as a second oracle for the hand-generated directed/random
+# suite (risc_tb.v), not just the assembled asm/*.s programs above.
+#
+#   make run_tb_qemu             risc_tb.v vs riscv_ref.v AND qemu-riscv32
+#
+# A risc_tb.v batch is not a standalone program (it starts from an arbitrary
+# seeded register file / data memory, not a zero reset), so unlike asm/*.s
+# there is no single qemu ELF to build once. Instead:
+#   1. risc_tb.v runs with +QEMU_DUMP=<dir>, dumping every batch's program and
+#      seed state to <dir>/batch_NNN.dump (harmless extra step; the run still
+#      checks everything against riscv_ref.v exactly as `make run` does).
+#   2. tb_batch_gen.py turns each dump into a synthetic qemu-runnable image
+#      that reproduces the batch's seeded state, and qemu_trace.py traces it
+#      exactly as it does for asm/*.s (see qemu/README.md).
+#   3. risc_tb.v runs AGAIN, this time with +QEMU_TRACE_DIR=<dir>, comparing
+#      the DUT against both riscv_ref.v and the per-batch qemu traces. Batch
+#      numbering lines up between the two runs because both walk the exact
+#      same sequence of run_batch calls (same SEED).
+#-----------------------------------------------------------------------------
+TB_QEMU_DIR     := $(BUILD)/tb_qemu_build
+TB_BATCH_GEN_PY := $(QEMU_DIR)/tb_batch_gen.py
+
+.PHONY: run_tb_qemu
+run_tb_qemu: qemu_plugin $(OUT)
+	@rm -rf $(TB_QEMU_DIR) && mkdir -p $(TB_QEMU_DIR)
+	@echo "==> [1/3] dumping risc_tb.v batches"
+	@cd $(BUILD) && $(VVP) $(TOP).vvp +QEMU_DUMP=$(abspath $(TB_QEMU_DIR)) > $(TB_QEMU_DIR)/dump.log 2>&1
+	@n=$$(ls $(TB_QEMU_DIR)/batch_*.dump 2>/dev/null | wc -l); \
+	 test "$$n" -gt 0 || { echo "*** no batch dumps produced - see $(TB_QEMU_DIR)/dump.log ***"; exit 1; }; \
+	 echo "    $$n batch(es) dumped"
+	@echo "==> [2/3] building + tracing each batch under qemu-riscv32"
+	@for d in $(TB_QEMU_DIR)/batch_*.dump; do \
+		b=$$(basename $$d .dump); \
+		$(PYTHON) $(TB_BATCH_GEN_PY) --dump $$d --out $(TB_QEMU_DIR)/$$b.s --data-base $(DATA_BASE) \
+			> $(TB_QEMU_DIR)/$$b.gen.log 2>&1 \
+			|| { echo "*** tb_batch_gen failed for $$b, see $(TB_QEMU_DIR)/$$b.gen.log ***"; exit 1; }; \
+		$(CC) -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles -Wl,--no-relax \
+			-Wl,-Tbss=$(DATA_BASE) -Wl,-Ttext=$(QEMU_TEXT) \
+			-o $(TB_QEMU_DIR)/$$b.elf $(TB_QEMU_DIR)/$$b.s \
+			|| { echo "*** assembly failed for $$b ***"; exit 1; }; \
+		{ read tmask; read dmask; read events; read maxinsn; } < $(TB_QEMU_DIR)/$$b.s.reloc; \
+		$(PYTHON) $(QEMU_TRACE_PY) --elf $(TB_QEMU_DIR)/$$b.elf --out $(TB_QEMU_DIR)/$$b.qtrace \
+			--qemu $(QEMU_BIN) --plugin $(QEMU_PLUGIN) --nm $(NM) --data-base $(DATA_BASE) \
+			--text-reloc-mask $$tmask --data-reloc-mask $$dmask --text-reloc-events "$$events" \
+			--max $$maxinsn \
+			> $(TB_QEMU_DIR)/$$b.trace.log 2>&1 \
+			|| { echo "*** qemu trace failed for $$b, see $(TB_QEMU_DIR)/$$b.trace.log ***"; exit 1; }; \
+	done
+	@echo "==> [3/3] lockstep run against both oracles"
+	@cd $(BUILD) && $(VVP) $(TOP).vvp +QEMU_TRACE_DIR=$(abspath $(TB_QEMU_DIR)) 2>&1 | tee $(TB_QEMU_DIR)/run_tb_qemu.log
+	@grep -q "^TB_STATUS: PASS$$" $(TB_QEMU_DIR)/run_tb_qemu.log \
+		|| { echo "*** risc_tb.v diverged from an oracle - see $(TB_QEMU_DIR)/run_tb_qemu.log ***"; exit 1; }
 
 #-----------------------------------------------------------------------------
 # ASIC synthesis (Yosys) + static timing analysis (OpenSTA)
@@ -219,11 +386,17 @@ lint:
 
 clean:
 	rm -f $(BUILD)/*.vvp $(BUILD)/*.vcd $(BUILD)/*.log
-	rm -rf $(ASM_MEM_DIR) $(SYNTH_OUT) $(LINT_OUT)
+	rm -rf $(ASM_MEM_DIR) $(SYNTH_OUT) $(LINT_OUT) $(TB_QEMU_DIR)
+	@$(MAKE) --no-print-directory -C $(QEMU_DIR) clean
 
 help:
-	@echo "targets : all compile run wave lint synth sta clean run_asm"
+	@echo "targets : all compile run wave lint synth sta clean"
+	@echo "          run_asm  run_asm_all   (asm/*.s core vs riscv_ref.v)"
+	@echo "          run_qemu run_qemu_all  (asm/*.s core vs riscv_ref.v AND qemu-riscv32)"
+	@echo "          run_tb_qemu            (risc_tb.v directed/random suite vs riscv_ref.v AND qemu-riscv32)"
+	@echo "          qemu_plugin            (build the QEMU trace plugin)"
 	@echo "options : DUMP=0 (no VCD)   SEED=<n> (random seed)"
-	@echo "          run_asm PROG=<name>  (assembles asm/<name>.s and runs it)"
+	@echo "          run_asm  PROG=<name> (assembles asm/<name>.s and runs it)"
+	@echo "          run_qemu PROG=<name> (same, plus the qemu oracle)"
 	@echo "          sta CLK_PERIOD=<ns>  (synth target period, default 10)"
 	@echo "          synth ABC_FAST=0     (full ABC opt instead of -fast; slow)"

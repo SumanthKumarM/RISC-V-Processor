@@ -2,8 +2,10 @@ sim/*.log
 sim/*.vvp
 sim/*.vcd
 sim/asm_build/
+sim/tb_qemu_build/
 synth/out/
 lint/out/
 docs/*.html
 synth/reports/
 lint/reports/
+qemu/*.so

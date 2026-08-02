@@ -2,11 +2,19 @@
 # zero extension for LB/LBU and LH/LHU at their sign-bit boundaries, and
 # negative-immediate addressing for both store and load.
 #
-# run: make run_asm PROG=load_store_corners   (from RISC-V-Processor/sim)
-.text
-.globl _start
-_start:
-    addi x1, x0, 0          # base pointer, byte 0
+# All addressing is relative to DATA_BASE (held in DATA_REG), so the byte
+# offsets below land on exactly the dmem words they always did - including the
+# negative-offset cases, which reach DATA_BASE+96 and DATA_BASE+64. See
+# core_defs.inc for why the window had to move off address 0.
+#
+# run: make run_asm  PROG=load_store_corners   (core vs riscv_ref.v)
+#      make run_qemu PROG=load_store_corners   (core vs riscv_ref.v AND qemu)
+#include "core_defs.inc"
+
+    CORE_DATA_REGION
+    CORE_ENTRY
+
+    addi x1, DATA_REG, 0    # base pointer, byte 0 of the data window
 
     # ---- four SBs into one word, confirm neighbouring bytes survive ----
     addi x2, x0, 0x11
@@ -42,12 +50,11 @@ _start:
     lhu  x14, 10(x1)          # expect 0x00007FFF
 
     # ---- negative-offset addressing (immS / immI sign extension) ----
-    addi x15, x0, 100          # base = byte 100
+    addi x15, DATA_REG, 100    # base = byte 100 of the data window
     addi x16, x0, 0x5AD
     sw   x16, -4(x15)           # store at byte 96
     lw   x17, -4(x15)           # load back, expect 0x5AD
     sw   x16, -36(x15)           # store at byte 64
     lw   x18, -36(x15)           # load back, expect 0x5AD
 
-halt:
-    jal x0, halt
+    CORE_HALT

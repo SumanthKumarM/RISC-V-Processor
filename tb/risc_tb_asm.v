@@ -6,12 +6,30 @@
 // GNU toolchain from a .mem file (see scripts/bin2mem.py) and streams it
 // into the DUT's instruction memory, exactly like a risc_tb.v batch.
 //
-// There is no separate "toolchain execution" oracle: the toolchain only
-// assembles the program, it doesn't run it. The ground truth for
-// correctness is riscv_ref.v, the same behavioural golden model that
-// verified 6453 hand-generated instructions with zero divergences in
-// Phase 2. Lockstep comparison here reuses that same model, one retired
-// instruction at a time.
+// The toolchain itself is not an oracle: gcc/as/ld only assemble the
+// program, they never run it. Correctness is judged by up to two independent
+// models, checked simultaneously and reported separately:
+//
+//   riscv_ref.v  (always on) - the behavioural golden model that verified
+//       6453 hand-generated instructions with zero divergences in Phase 2.
+//       Compared on pc, all 32 registers and all 64 data-memory words.
+//
+//   qemu-riscv32 (optional, +QEMUTRACE=<path>) - a pre-recorded trace from a
+//       mature, independently developed implementation with no relationship
+//       to this repository. See qemu/README.md for how the trace is produced.
+//
+// The second model is what makes a passing run mean something stronger. risc.v
+// and riscv_ref.v were written by the same author from the same reading of the
+// spec, so they can agree on a wrong answer and lockstep would never notice;
+// qemu cannot make that same mistake by construction. Both models are checked
+// on every retired instruction and the summary reports each one's divergence
+// count on its own, so it is always clear which oracle objected.
+//
+// The qemu trace supplies pc, the 32 registers, and the stores the program
+// performed. Stores are folded into a shadow data memory using the core's own
+// addr[7:2] aliasing, which is then compared against the DUT's data_mem in
+// full - so memory is checked directly against qemu, not just inferred from
+// later loads.
 //
 // Halt convention: every example program must end with a self-branch/jump
 // (e.g. `1: jal x0, 1b` or `beq x0,x0,0`) - the same convention risc_tb.v
@@ -21,8 +39,12 @@
 // programs contain loops whose retired-instruction count isn't known
 // ahead of time.
 //
-// Usage (normally driven by `make run_asm PROG=<name>` in sim/Makefile):
-//   vvp risc_tb_asm.vvp +MEMFILE=<path/to/program.mem>
+// Usage (normally driven by sim/Makefile):
+//   make run_asm  PROG=<name>    -> vvp ... +MEMFILE=<prog.mem>
+//   make run_qemu PROG=<name>    -> vvp ... +MEMFILE=<prog.mem> \
+//                                            +QEMUTRACE=<prog.qtrace>
+// Omitting +QEMUTRACE leaves the run exactly as it was before the qemu oracle
+// existed: golden model only.
 //=============================================================================
 `timescale 1ns/1ps
 
@@ -71,6 +93,25 @@ module risc_tb_asm;
     integer    max_report;
 
     reg [8*1024-1:0] mem_path;
+
+    //-------------------------------------------------------------------------
+    // qemu oracle state (inactive unless +QEMUTRACE=<path> is given)
+    //
+    // The trace is streamed one record per retired instruction rather than
+    // slurped into an array: a record is 34 words and a run can retire tens of
+    // thousands of instructions, so holding the whole thing would cost far
+    // more memory than the DUT itself.
+    //-------------------------------------------------------------------------
+    reg [8*1024-1:0] qt_path;
+    integer          qt_fd;            // 0 when the oracle is off
+    integer          qt_total;         // records the trace claims to hold
+    integer          qt_read;          // records consumed so far
+    reg              qt_exhausted;     // trace ran out before the core halted
+    reg [31:0]       qt_pc;
+    reg [31:0]       qt_regs [0:31];
+    reg [31:0]       qt_dmem [0:63];   // shadow memory rebuilt from qemu stores
+    integer          qerrors;          // divergences against qemu
+    integer          qchecks;
 
     //=========================================================================
     // mnemonic decode, purely for readable failure/trace messages
@@ -241,6 +282,134 @@ module risc_tb_asm;
         end
     endtask
 
+    //=========================================================================
+    // qemu oracle: open the trace named by +QEMUTRACE=<path>
+    //=========================================================================
+    task qt_open;
+        integer rc, i;
+        begin
+            qt_fd        = 0;
+            qt_total     = 0;
+            qt_read      = 0;
+            qt_exhausted = 1'b0;
+            for(i=0;i<64;i=i+1) qt_dmem[i] = 32'd0;
+
+            if($value$plusargs("QEMUTRACE=%s", qt_path)) begin
+                qt_fd = $fopen(qt_path, "r");
+                if(qt_fd == 0) begin
+                    $display("ERROR: could not open QEMUTRACE '%0s'", qt_path);
+                    $finish;
+                end
+                rc = $fscanf(qt_fd, "%d", qt_total);
+                if(rc != 1 || qt_total <= 0) begin
+                    $display("ERROR: QEMUTRACE '%0s' is missing its record-count header", qt_path);
+                    $finish;
+                end
+            end
+        end
+    endtask
+
+    //=========================================================================
+    // Fold one qemu store into the shadow data memory.
+    //
+    // Uses the core's own geometry: data_mem is 64 words indexed by addr[7:2]
+    // (see rtl/risc.v), so every address aliases into a 256-byte window. The
+    // trace carries absolute addresses (DATA_BASE+k), and applying that same
+    // aliasing here is what lets the shadow be compared word-for-word against
+    // the DUT's memory.
+    //=========================================================================
+    task qt_apply_store;
+        input [31:0] addr;
+        input [31:0] sz;
+        input [31:0] data;
+        reg [5:0] w;
+        begin
+            w = addr[7:2];
+            case(sz)
+                32'd1 : case(addr[1:0])
+                            2'b00 : qt_dmem[w][7:0]   = data[7:0];
+                            2'b01 : qt_dmem[w][15:8]  = data[7:0];
+                            2'b10 : qt_dmem[w][23:16] = data[7:0];
+                            2'b11 : qt_dmem[w][31:24] = data[7:0];
+                        endcase
+                32'd2 : if(addr[1]) qt_dmem[w][31:16] = data[15:0];
+                        else        qt_dmem[w][15:0]  = data[15:0];
+                32'd4 : qt_dmem[w] = data;
+                default : begin
+                    qerrors = qerrors + 1;
+                    $display("    qemu trace: unexpected store size %0d at addr %h", sz, addr);
+                end
+            endcase
+        end
+    endtask
+
+    //=========================================================================
+    // Consume the next qemu record and compare the full architectural state.
+    //=========================================================================
+    task qt_step;
+        input integer idx;
+        input [31:0]  ir_pc;
+        input [31:0]  ir;
+        integer i, rc, nst, s;
+        reg [31:0] a, sz, d;
+        reg        bad;
+        begin
+            if(qt_fd != 0) begin
+                if(qt_read >= qt_total) begin
+                    // Expected exactly once: the core still has to retire its
+                    // halt self-loop, which has no counterpart in the qemu
+                    // build (it exits via a syscall instead), so the trace
+                    // legitimately ends one instruction earlier.
+                    qt_exhausted = 1'b1;
+                end
+                else begin
+                    rc = $fscanf(qt_fd, "%h", qt_pc);
+                    if(rc != 1) begin
+                        $display("ERROR: qemu trace truncated at record %0d", qt_read);
+                        $finish;
+                    end
+                    for(i=0;i<32;i=i+1) rc = $fscanf(qt_fd, "%h", qt_regs[i]);
+                    rc = $fscanf(qt_fd, "%h", nst);
+                    for(s=0;s<nst;s=s+1) begin
+                        rc = $fscanf(qt_fd, "%h", a);
+                        rc = $fscanf(qt_fd, "%h", sz);
+                        rc = $fscanf(qt_fd, "%h", d);
+                        qt_apply_store(a, sz, d);
+                    end
+
+                    qt_read = qt_read + 1;
+                    qchecks = qchecks + 1;
+
+                    bad = 1'b0;
+                    if(pc !== qt_pc) bad = 1'b1;
+                    for(i=0;i<32;i=i+1)
+                        if(DUT.register_file.mem[i] !== qt_regs[i]) bad = 1'b1;
+                    for(i=0;i<64;i=i+1)
+                        if(DUT.data_memory.mem[i] !== qt_dmem[i]) bad = 1'b1;
+
+                    if(bad) begin
+                        qerrors = qerrors + 1;
+                        if(qerrors <= max_report) begin
+                            $display("\n    QEMU ERROR #%0d @ instr %0d", qerrors, idx);
+                            $display("      pc=%h  ir=%h (%0s)", ir_pc, ir, mnem(ir));
+                            $display("      rd=x%0d rs1=x%0d rs2=x%0d", ir[11:7], ir[19:15], ir[24:20]);
+                            if(pc !== qt_pc)
+                                $display("      PC  : dut=%h qemu=%h", pc, qt_pc);
+                            for(i=0;i<32;i=i+1)
+                                if(DUT.register_file.mem[i] !== qt_regs[i])
+                                    $display("      x%-2d : dut=%h qemu=%h", i, DUT.register_file.mem[i], qt_regs[i]);
+                            for(i=0;i<64;i=i+1)
+                                if(DUT.data_memory.mem[i] !== qt_dmem[i])
+                                    $display("      mem[%0d] : dut=%h qemu=%h", i*4, DUT.data_memory.mem[i], qt_dmem[i]);
+                            if(qerrors == max_report)
+                                $display("      ... suppressing further details ...");
+                        end
+                    end
+                end
+            end
+        end
+    endtask
+
     task dump_state;
         integer i;
         begin
@@ -291,6 +460,7 @@ module risc_tb_asm;
             for(i=0;i<64;i=i+1) begin
                 DUT.data_memory.mem[i] = 32'd0;
                 REF.dmem[i]            = 32'd0;
+                qt_dmem[i]             = 32'd0;   // shadow starts zeroed too
             end
 
             // ---- 4. lockstep execution until the halt self-loop or MAX_INSTR
@@ -309,6 +479,7 @@ module risc_tb_asm;
                     REF.step;
                     instr_count = instr_count + 1;
                     compare(i, ir_pc, ir);
+                    qt_step(i, ir_pc, ir);   // no-op unless +QEMUTRACE was given
                     if((i % 50) == 49)
                         $write("[%0d]", i+1);
                     else if((i % 10) == 9)
@@ -340,17 +511,25 @@ module risc_tb_asm;
         imem_load_data = 32'd0;
         errors         = 0;
         checks         = 0;
+        qerrors        = 0;
+        qchecks        = 0;
         instr_count    = 0;
         max_report     = 25;
 
         if(!$value$plusargs("MEMFILE=%s", mem_path)) begin
-            $display("ERROR: usage: +MEMFILE=<path/to/program.mem>");
+            $display("ERROR: usage: +MEMFILE=<path/to/program.mem> [+QEMUTRACE=<path>]");
             $finish;
         end
 
+        qt_open;
+
         $display("=========================================================");
         $display(" RV32I + RV32M core: single-program lockstep run");
-        $display(" Reference: riscv_ref.v (same golden model as risc_tb.v)");
+        $display(" Oracle 1: riscv_ref.v (same golden model as risc_tb.v)");
+        if(qt_fd != 0)
+            $display(" Oracle 2: qemu-riscv32 trace, %0d record(s)", qt_total);
+        else
+            $display(" Oracle 2: (none - pass +QEMUTRACE=<path> to add qemu)");
         $display("=========================================================\n");
 
         load_program;
@@ -359,20 +538,55 @@ module risc_tb_asm;
         $display("=========================================================");
         $display(" RUN SUMMARY");
         $display("=========================================================");
+        // The core retires its halt self-loop, which the qemu build does not
+        // have (it exits via a syscall), so the trace is expected to come up
+        // exactly one record short. Anything more means the two sides walked
+        // different numbers of instructions - a control-flow divergence that
+        // deserves to be reported even if every compared record matched.
+        if(qt_fd != 0 && qt_read < qt_total) begin
+            qerrors = qerrors + 1;
+            $display("\n    QEMU ERROR: core stopped after consuming %0d of %0d trace record(s);",
+                     qt_read, qt_total);
+            $display("      qemu executed %0d more instruction(s) than the DUT did",
+                     qt_total - qt_read);
+        end
+
+        $display("=========================================================");
         $display(" instructions retired : %0d", instr_count);
-        $display(" state checks         : %0d (pc + regs + dmem)", checks);
-        $display(" errors found         : %0d", errors);
-        if(errors == 0) begin
+        $display("---------------------------------------------------------");
+        $display(" vs riscv_ref.v  : %0d check(s), %0d error(s)  [pc + regs + dmem]",
+                 checks, errors);
+        if(qt_fd != 0)
+            $display(" vs qemu-riscv32 : %0d check(s), %0d error(s)  [pc + regs + dmem]",
+                     qchecks, qerrors);
+        else
+            $display(" vs qemu-riscv32 : not run");
+        $display("---------------------------------------------------------");
+        if(errors == 0 && qerrors == 0) begin
             $display(" ");
-            $display(" ✓ PASS  DUT matched the golden model on every retired instruction");
+            if(qt_fd != 0)
+                $display(" ✓ PASS  DUT matched BOTH independent models on every retired instruction");
+            else
+                $display(" ✓ PASS  DUT matched the golden model on every retired instruction");
         end
         else begin
             $display(" ");
-            $display(" ✗ FAIL  %0d instruction(s) diverged from the golden model", errors);
+            if(errors != 0)
+                $display(" ✗ FAIL  %0d instruction(s) diverged from riscv_ref.v", errors);
+            if(qerrors != 0)
+                $display(" ✗ FAIL  %0d instruction(s) diverged from qemu-riscv32", qerrors);
+            // Which oracles objected narrows the cause considerably: both
+            // means the DUT is wrong, qemu alone means riscv_ref.v shares the
+            // DUT's misreading of the spec - the exact blind spot the second
+            // oracle was added to expose.
+            if(errors == 0 && qerrors != 0)
+                $display("         (riscv_ref.v agreed with the DUT here - suspect a shared");
+            if(errors == 0 && qerrors != 0)
+                $display("          misreading of the spec in risc.v AND riscv_ref.v)");
         end
         dump_state;
         $display("=========================================================");
-        $display("TB_STATUS: %0s", errors == 0 ? "PASS" : "FAIL");
+        $display("TB_STATUS: %0s", (errors == 0 && qerrors == 0) ? "PASS" : "FAIL");
         $finish;
     end
 

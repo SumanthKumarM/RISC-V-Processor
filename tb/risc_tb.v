@@ -76,6 +76,34 @@ module risc_tb;
     integer rseed;
     integer gi, gj, gt;
 
+    //-------------------------------------------------------------------------
+    // qemu oracle plumbing (optional second oracle, per batch)
+    //
+    //   +QEMU_DUMP=<dir>       dump each batch's program+seeds to
+    //                          <dir>/batch_NNN.dump for offline processing by
+    //                          qemu/tb_batch_gen.py + qemu/qemu_trace.py into
+    //                          <dir>/batch_NNN.qtrace
+    //   +QEMU_TRACE_DIR=<dir>  compare each batch against <dir>/batch_NNN.qtrace,
+    //                          in addition to the riscv_ref.v check every batch
+    //                          already gets
+    //
+    // A batch is not a standalone program (it starts from an arbitrary seeded
+    // register file / data memory, not a zero reset), so unlike asm/*.s there
+    // is no single qemu ELF to run once. Instead risc_tb.v itself is run
+    // TWICE with the same SEED: once to dump the deterministically-generated
+    // batches, once more to compare against the traces produced from those
+    // dumps. Batch numbering (the `batches` counter) lines up between the two
+    // runs because both walk the exact same sequence of run_batch calls.
+    //-------------------------------------------------------------------------
+    reg [8*256:1] qdump_dir, qtrace_dir;
+    integer       qdump_en, qtrace_en;
+    integer       qerrors, qchecks;
+
+    integer       qt_fd, qt_total, qt_read;
+    reg [31:0]    qt_pc;
+    reg [31:0]    qt_regs [0:31];
+    reg [31:0]    qt_dmem [0:63];
+
     //=========================================================================
     // instruction encoders
     //=========================================================================
@@ -294,8 +322,183 @@ module risc_tb;
         end
     endtask
 
+    //=========================================================================
+    // qemu oracle: dump a batch's program + seeds for offline processing
+    //
+    // treloc/dreloc are bitmasks over registers 1..31: treloc marks registers
+    // that hold a small offset from the BATCH'S OWN pc=0 start (typically a
+    // JALR target computed against the core's zero-based address space -
+    // e.g. `jalr x9,0(x9)` with x9 seeded to 16, meaning "16 bytes into this
+    // program"), which tb_batch_gen.py must turn into __trace_start+offset
+    // under qemu. dreloc marks registers that hold an offset into the 64-word
+    // data window (the load/store base register, always x1 by convention in
+    // this testbench), which must become DATA_BASE+offset under qemu. Most
+    // batches need neither (0,0): ALU/branch/jump-immediate streams are
+    // relocation-free because every address in them is either pc-relative or
+    // computed at runtime by the DUT itself.
+    //=========================================================================
+    task dump_batch;
+        input integer bnum;
+        input [31:0]  treloc;
+        input [31:0]  dreloc;
+        integer fd, i;
+        reg [8*300:1] path;
+        begin
+            $sformat(path, "%0s/batch_%03d.dump", qdump_dir, bnum);
+            fd = $fopen(path, "w");
+            if(fd == 0) begin
+                $display("ERROR: could not open dump file '%0s'", path);
+                $finish;
+            end
+            $fdisplay(fd, "%0d", prog_len);
+            for(i=0;i<prog_len;i=i+1) $fdisplay(fd, "%08x", prog[i]);
+            for(i=0;i<32;i=i+1)       $fdisplay(fd, "%08x", seed_reg[i]);
+            for(i=0;i<64;i=i+1)       $fdisplay(fd, "%08x", seed_mem[i]);
+            $fdisplay(fd, "%08x", treloc);
+            $fdisplay(fd, "%08x", dreloc);
+            $fclose(fd);
+        end
+    endtask
+
+    //=========================================================================
+    // qemu oracle: open/consume/close the per-batch trace produced offline
+    // (same record format and shadow-memory folding as risc_tb_asm.v's qt_*
+    // tasks; duplicated rather than shared because the two testbenches are
+    // compiled as separate top-level modules)
+    //=========================================================================
+    task qt_open_batch;
+        input integer bnum;
+        integer rc, i;
+        reg [8*300:1] path;
+        begin
+            qt_fd = 0; qt_total = 0; qt_read = 0;
+            // The shadow memory must start from the SAME pre-seeded baseline
+            // DUT.data_memory and REF.dmem get (see run_batch step 3 below),
+            // not zero: a batch's data memory is seeded before execution, and
+            // words the program never stores to stay at that seed forever -
+            // qemu's own memory was seeded identically by tb_batch_gen.py's
+            // prologue, but the trace itself only ever records STORES, so
+            // without this the shadow would incorrectly start blank.
+            for(i=0;i<64;i=i+1) qt_dmem[i] = seed_mem[i];
+            if(qtrace_en) begin
+                $sformat(path, "%0s/batch_%03d.qtrace", qtrace_dir, bnum);
+                qt_fd = $fopen(path, "r");
+                if(qt_fd == 0) begin
+                    $display("ERROR: could not open QEMUTRACE '%0s'", path);
+                    $finish;
+                end
+                rc = $fscanf(qt_fd, "%d", qt_total);
+                if(rc != 1 || qt_total < 0) begin
+                    $display("ERROR: QEMUTRACE '%0s' missing record-count header", path);
+                    $finish;
+                end
+            end
+        end
+    endtask
+
+    task qt_apply_store;
+        input [31:0] addr;
+        input [31:0] sz;
+        input [31:0] data;
+        reg [5:0] w;
+        begin
+            w = addr[7:2];
+            case(sz)
+                32'd1 : case(addr[1:0])
+                            2'b00 : qt_dmem[w][7:0]   = data[7:0];
+                            2'b01 : qt_dmem[w][15:8]  = data[7:0];
+                            2'b10 : qt_dmem[w][23:16] = data[7:0];
+                            2'b11 : qt_dmem[w][31:24] = data[7:0];
+                        endcase
+                32'd2 : if(addr[1]) qt_dmem[w][31:16] = data[15:0];
+                        else        qt_dmem[w][15:0]  = data[15:0];
+                32'd4 : qt_dmem[w] = data;
+                default : begin
+                    qerrors = qerrors + 1;
+                    $display("    qemu trace: unexpected store size %0d at addr %h", sz, addr);
+                end
+            endcase
+        end
+    endtask
+
+    // Excludes the batch's appended halt self-loop: that instruction has no
+    // qemu counterpart (a real self-loop would hang qemu forever), so the
+    // caller must not invoke this for the final (prog_len-1) instruction.
+    task qt_step_batch;
+        input [8*24:1] tname;
+        input integer  idx;
+        input [31:0]   ir_pc;
+        input [31:0]   ir;
+        integer i, rc, nst, s;
+        reg [31:0] a, sz, d;
+        reg        bad;
+        begin
+            if(qt_fd != 0 && qt_read < qt_total) begin
+                rc = $fscanf(qt_fd, "%h", qt_pc);
+                if(rc != 1) begin
+                    $display("ERROR: qemu trace truncated at record %0d", qt_read);
+                    $finish;
+                end
+                for(i=0;i<32;i=i+1) rc = $fscanf(qt_fd, "%h", qt_regs[i]);
+                rc = $fscanf(qt_fd, "%h", nst);
+                for(s=0;s<nst;s=s+1) begin
+                    rc = $fscanf(qt_fd, "%h", a);
+                    rc = $fscanf(qt_fd, "%h", sz);
+                    rc = $fscanf(qt_fd, "%h", d);
+                    qt_apply_store(a, sz, d);
+                end
+
+                qt_read = qt_read + 1;
+                qchecks = qchecks + 1;
+
+                bad = 1'b0;
+                if(pc !== qt_pc) bad = 1'b1;
+                for(i=0;i<32;i=i+1)
+                    if(DUT.register_file.mem[i] !== qt_regs[i]) bad = 1'b1;
+                for(i=0;i<64;i=i+1)
+                    if(DUT.data_memory.mem[i] !== qt_dmem[i]) bad = 1'b1;
+
+                if(bad) begin
+                    qerrors = qerrors + 1;
+                    if(qerrors <= max_report) begin
+                        $display("\n    QEMU ERROR #%0d @ [%0s] instr %0d", qerrors, tname, idx);
+                        $display("      pc=%h  ir=%h (%0s)", ir_pc, ir, mnem(ir));
+                        $display("      rd=x%0d rs1=x%0d rs2=x%0d", ir[11:7], ir[19:15], ir[24:20]);
+                        if(pc !== qt_pc)
+                            $display("      PC  : dut=%h qemu=%h", pc, qt_pc);
+                        for(i=0;i<32;i=i+1)
+                            if(DUT.register_file.mem[i] !== qt_regs[i])
+                                $display("      x%-2d : dut=%h qemu=%h", i, DUT.register_file.mem[i], qt_regs[i]);
+                        for(i=0;i<64;i=i+1)
+                            if(DUT.data_memory.mem[i] !== qt_dmem[i])
+                                $display("      mem[%0d] : dut=%h qemu=%h", i*4, DUT.data_memory.mem[i], qt_dmem[i]);
+                        if(qerrors == max_report)
+                            $display("      ... suppressing further details ...");
+                    end
+                end
+            end
+        end
+    endtask
+
+    task qt_close_batch;
+        input [8*24:1] tname;
+        input integer  bnum;
+        begin
+            if(qtrace_en) begin
+                if(qt_read != qt_total) begin
+                    qerrors = qerrors + 1;
+                    $display("\n    QEMU ERROR @ [%0s] batch %0d: consumed %0d of %0d trace record(s)",
+                             tname, bnum, qt_read, qt_total);
+                end
+                if(qt_fd != 0) $fclose(qt_fd);
+            end
+        end
+    endtask
+
     task run_batch;
         input [8*24:1] tname;
+        input [31:0]   treloc;   // qemu oracle: registers needing +__trace_start reloc
+        input [31:0]   dreloc;   // qemu oracle: registers needing +DATA_BASE reloc
         integer i;
         reg     timeout, bail;
         reg [31:0] ir_pc, ir;
@@ -303,6 +506,9 @@ module risc_tb;
             emit(btype(13'd0, 5'd0, 5'd0, 3'b000, BRANCH)); // halt: beq x0,x0,0
             batches = batches + 1;
             $display("  [batch %3d] %-16s : %3d instructions", batches, tname, prog_len-1);
+
+            if(qdump_en) dump_batch(batches, treloc, dreloc);
+            qt_open_batch(batches);
 
             // ---- 1. reset the DUT (clears pc, regs, dmem and the load pointer)
             rst          = 1'b1;
@@ -351,6 +557,8 @@ module risc_tb;
                         REF.step;
                         instr_count = instr_count + 1;
                         compare(tname, i, ir_pc, ir);
+                        // the appended halt (index prog_len-1) has no qemu counterpart
+                        if(i < prog_len-1) qt_step_batch(tname, i, ir_pc, ir);
                         // show progress: print dots every 10 instructions, numbers every 50
                         if((i % 50) == 49)
                             $write("[%3d]", i+1);
@@ -360,6 +568,7 @@ module risc_tb;
                     end
                 end
             end
+            qt_close_batch(tname, batches);
             if(prog_len > 1) $display(" done");
             else $display("");
         end
@@ -390,7 +599,7 @@ module risc_tb;
                 for(gi=1;gi<=12;gi=gi+1)
                     for(gj=1;gj<=12;gj=gj+1)
                         emit(rtype(f7, gj[4:0], gi[4:0], f3, 5'd20, OP));
-                run_batch("R-type");
+                run_batch("R-type", 32'h0, 32'h0);
             end
         end
     endtask
@@ -404,7 +613,7 @@ module risc_tb;
                 for(gi=1;gi<=12;gi=gi+1)
                     for(gj=1;gj<=12;gj=gj+1)
                         emit(rtype(7'b0000001, gj[4:0], gi[4:0], gt[2:0], 5'd20, OP));
-                run_batch("RV32M");
+                run_batch("RV32M", 32'h0, 32'h0);
             end
         end
     endtask
@@ -438,7 +647,7 @@ module risc_tb;
                         endcase
                         emit(itype(imm, gi[4:0], f3, 5'd20, OPIMM));
                     end
-                run_batch("I-type");
+                run_batch("I-type", 32'h0, 32'h0);
             end
         end
     endtask
@@ -459,7 +668,7 @@ module risc_tb;
                 for(gi=1;gi<=6;gi=gi+1)
                     for(gj=0;gj<32;gj=gj+1)
                         emit(itype({f7,gj[4:0]}, gi[4:0], f3, 5'd20, OPIMM));
-                run_batch("shift-imm");
+                run_batch("shift-imm", 32'h0, 32'h0);
             end
         end
     endtask
@@ -484,7 +693,7 @@ module risc_tb;
                         emit(btype(13'd8, gj[4:0], gi[4:0], f3, BRANCH));
                         emit(itype(12'd1, 5'd0, 3'b000, 5'd20, OPIMM)); // skipped if taken
                     end
-                run_batch("branch");
+                run_batch("branch", 32'h0, 32'h0);
             end
         end
     endtask
@@ -502,7 +711,7 @@ module risc_tb;
             emit(itype(12'd99, 5'd0, 3'b000, 5'd4, OPIMM));     // 3: addi x4,x0,99
             // 10 iterations x 3 instructions + tail; padded by the halt
             prog_len = prog_len; // keep as-is
-            run_batch("loop");
+            run_batch("loop", 32'h0, 32'h0);
         end
     endtask
 
@@ -520,7 +729,7 @@ module risc_tb;
             emit(itype(12'd2,  5'd0, 3'b000, 5'd20, OPIMM));    // 5: skipped
             emit(itype(12'd3,  5'd0, 3'b000, 5'd20, OPIMM));    // 6: skipped
             emit(itype(12'd42, 5'd0, 3'b000, 5'd4, OPIMM));     // 7: addi x4,x0,42
-            run_batch("jump-basic");
+            run_batch("jump-basic", 32'h0, 32'h0);
 
             // --- jalr with an odd target: bit 0 of the result must be cleared ---
             clear_prog; clear_seed;
@@ -530,7 +739,10 @@ module risc_tb;
             emit(itype(12'd2, 5'd0, 3'b000, 5'd20, OPIMM));     // 2
             emit(itype(12'd3, 5'd0, 3'b000, 5'd20, OPIMM));     // 3
             emit(itype(12'd7, 5'd0, 3'b000, 5'd7, OPIMM));      // 4: at byte 16
-            run_batch("jalr-odd");
+            // x5 holds a literal offset into this batch's own instruction
+            // stream (a core-address JALR target) - qemu oracle needs it
+            // relocated to __trace_start+13, hence treloc bit 5.
+            run_batch("jalr-odd", 32'h0000_0020, 32'h0);
 
             // --- jal/jalr writing x0: link value must be discarded ---
             clear_prog; clear_seed;
@@ -539,7 +751,7 @@ module risc_tb;
             emit(itype(12'd1, 5'd0, 3'b000, 5'd20, OPIMM));     // 1: skipped
             emit(itype(12'd0, 5'd5, 3'b000, 5'd0, JALR_OP));    // 2: jalr x0,0(x5) -> 12
             emit(itype(12'd9, 5'd0, 3'b000, 5'd8, OPIMM));      // 3: at byte 12
-            run_batch("jump-x0");
+            run_batch("jump-x0", 32'h0000_0020, 32'h0);         // x5 again holds a JALR target
 
             // --- jalr where rd == rs1 ---
             // The target must be computed from the ORIGINAL rs1, even though
@@ -551,7 +763,7 @@ module risc_tb;
             emit(itype(12'd2, 5'd0, 3'b000, 5'd20, OPIMM));     // 2
             emit(itype(12'd3, 5'd0, 3'b000, 5'd20, OPIMM));     // 3
             emit(itype(12'd5, 5'd0, 3'b000, 5'd10, OPIMM));     // 4: at byte 16
-            run_batch("jalr-rd-eq-rs1");
+            run_batch("jalr-rd-eq-rs1", 32'h0000_0200, 32'h0);  // x9 holds the JALR target
 
             // --- negative jal offset (backward jump) ---
             clear_prog; clear_seed;
@@ -559,7 +771,7 @@ module risc_tb;
             emit(itype(12'd1, 5'd0, 3'b000, 5'd20, OPIMM));     // 1
             emit(itype(12'd7, 5'd0, 3'b000, 5'd11, OPIMM));     // 2: landing pad
             emit(jtype(-21'sd4, 5'd2, JAL_OP));                 // 3: jal x2,-4 -> 8
-            run_batch("jal-backward");
+            run_batch("jal-backward", 32'h0, 32'h0);
         end
     endtask
 
@@ -582,7 +794,7 @@ module risc_tb;
                 emit(utype(u, 5'd20, LUI_OP));
                 emit(utype(u, 5'd21, AUIPC));
             end
-            run_batch("lui-auipc");
+            run_batch("lui-auipc", 32'h0, 32'h0);
         end
     endtask
 
@@ -610,7 +822,9 @@ module risc_tb;
             emit(itype(12'd10, 5'd1, 3'b101, 5'd25, LOAD));            // lhu @10
             emit(stype(12'd16, 5'd4, 5'd1, 3'b010, STORE));            // sw  @16
             emit(itype(12'd16, 5'd1, 3'b010, 5'd26, LOAD));            // lw  @16
-            run_batch("ld-st-basic");
+            // x1 is the load/store base register (by this testbench's
+            // convention); qemu oracle needs it relocated to DATA_BASE+offset.
+            run_batch("ld-st-basic", 32'h0, 32'h0000_0002);
 
             // sign-extension corners: 0x80 / 0x7F bytes and 0x8000 / 0x7FFF halves
             clear_prog; clear_seed;
@@ -629,7 +843,7 @@ module risc_tb;
             emit(itype(12'd4,  5'd1, 3'b101, 5'd24, LOAD));   // lhu -> 0x00008000
             emit(stype(12'd6,  5'd5, 5'd1, 3'b001, STORE));   // sh 0x7FFF
             emit(itype(12'd6,  5'd1, 3'b001, 5'd25, LOAD));   // lh  -> 0x00007FFF
-            run_batch("ld-st-signext");
+            run_batch("ld-st-signext", 32'h0, 32'h0000_0002);
 
             // negative store/load offsets, exercising immS sign extension
             clear_prog; clear_seed;
@@ -639,7 +853,7 @@ module risc_tb;
             emit(itype(-12'sd4, 5'd1, 3'b010, 5'd20, LOAD));  // lw x20,-4(x1)
             emit(stype(-12'sd64, 5'd2, 5'd1, 3'b010, STORE)); // sw -> byte 0
             emit(itype(-12'sd64, 5'd1, 3'b010, 5'd21, LOAD));
-            run_batch("ld-st-negoff");
+            run_batch("ld-st-negoff", 32'h0, 32'h0000_0002);
         end
     endtask
 
@@ -654,7 +868,7 @@ module risc_tb;
             emit(rtype(7'b0000001, 5'd5, 5'd6, 3'b000, 5'd0, OP));     // mul  x0
             emit(itype(12'd0, 5'd1, 3'b010, 5'd0, LOAD));              // lw   x0,0(x1)
             emit(rtype(7'd0, 5'd0, 5'd0, 3'b000, 5'd20, OP));          // add  x20,x0,x0
-            run_batch("x0-behaviour");
+            run_batch("x0-behaviour", 32'h0, 32'h0000_0002);           // x1 is the lw base
         end
     endtask
 
@@ -706,7 +920,25 @@ module risc_tb;
                     // addresses would drift off their natural alignment, and
                     // misaligned access is explicitly undefined in this core -
                     // testing it would be testing nothing.
+                    //
+                    // x1 is ALSO excluded as a general ALU source (rs1a/rs2a)
+                    // here, not just as a destination: the qemu oracle (see
+                    // qemu/tb_batch_gen.py) reproduces x1's role as a load/
+                    // store base by giving it a DIFFERENT absolute value than
+                    // the DUT (DATA_BASE+0 under qemu vs plain 0 on the core -
+                    // qemu cannot map address 0). Reading x1 into an ordinary
+                    // ADD/AND/MUL/etc would bake that qemu-only offset into
+                    // whatever register receives the result, and for anything
+                    // other than pure +/- it is not even a constant offset
+                    // (e.g. AND with a DATA_BASE-shifted operand does not
+                    // differ from the DUT's by a fixed amount at all) - not
+                    // reconcilable after the fact, so the only sound fix is to
+                    // never let x1 enter general ALU arithmetic in the first
+                    // place. This does not reduce ISA coverage: x1 already
+                    // gets full load/store coverage as the dedicated base.
                     if(rd == 5'd1) rd = 5'd2;
+                    if(rs1a == 5'd1) rs1a = 5'd2;
+                    if(rs2a == 5'd1) rs2a = 5'd2;
 
                     if(sel < 40) begin
                         // RV32I R-type
@@ -746,7 +978,7 @@ module risc_tb;
                         end
                     end
                 end
-                run_batch("random");
+                run_batch("random", 32'h0, 32'h0000_0002);              // x1 is the load/store base
             end
         end
     endtask
@@ -770,6 +1002,10 @@ module risc_tb;
         batches        = 0;
         max_report     = 25;
         rseed          = SEED;
+        qerrors        = 0;
+        qchecks        = 0;
+        qdump_en       = $value$plusargs("QEMU_DUMP=%s", qdump_dir);
+        qtrace_en      = $value$plusargs("QEMU_TRACE_DIR=%s", qtrace_dir);
 
         clear_seed;
 
@@ -777,6 +1013,12 @@ module risc_tb;
         $display(" RV32I + RV32M core verification (lockstep vs reference)");
         $display(" Lockstep: full state (pc, regs, memory) checked after");
         $display(" every instruction execution against golden model");
+        if(qdump_en)
+            $display(" qemu oracle: dumping batches to %0s", qdump_dir);
+        else if(qtrace_en)
+            $display(" qemu oracle: comparing batches against traces in %0s", qtrace_dir);
+        else
+            $display(" qemu oracle: not run (see qemu/README.md, `make run_tb_qemu`)");
         $display("=========================================================\n");
 
         $display("DIRECTED TESTS:");
@@ -808,22 +1050,31 @@ module risc_tb;
         $display("=========================================================");
         $display(" test batches         : %0d", batches);
         $display(" instructions retired : %0d", instr_count);
-        $display(" state checks         : %0d (pc + regs + dmem)", checks);
-        $display(" errors found         : %0d", errors);
-        if(errors == 0) begin
+        $display(" vs riscv_ref.v       : %0d check(s), %0d error(s)  [pc + regs + dmem]", checks, errors);
+        if(qtrace_en)
+            $display(" vs qemu-riscv32      : %0d check(s), %0d error(s)  [pc + regs + dmem]", qchecks, qerrors);
+        else if(!qdump_en)
+            $display(" vs qemu-riscv32      : not run (`make run_tb_qemu`, see qemu/README.md)");
+        if(errors == 0 && qerrors == 0) begin
             $display(" ");
-            $display(" ✓ PASS  All %0d instructions verified correctly", instr_count);
+            if(qtrace_en)
+                $display(" ✓ PASS  All %0d instructions verified correctly vs BOTH oracles", instr_count);
+            else
+                $display(" ✓ PASS  All %0d instructions verified correctly", instr_count);
         end
         else begin
             $display(" ");
-            $display(" ✗ FAIL  %0d instructions diverged from golden model", errors);
+            if(errors != 0)
+                $display(" ✗ FAIL  %0d instruction(s) diverged from riscv_ref.v", errors);
+            if(qerrors != 0)
+                $display(" ✗ FAIL  %0d instruction(s) diverged from qemu-riscv32", qerrors);
             $display("         See ERROR logs above for details");
         end
         $display("=========================================================");
         // Plain-ASCII marker for tooling (Makefile pass/fail check). Kept
         // separate from the pretty summary above so reformatting the human
         // output can never silently break the machine check.
-        $display("TB_STATUS: %0s", errors == 0 ? "PASS" : "FAIL");
+        $display("TB_STATUS: %0s", (errors == 0 && qerrors == 0) ? "PASS" : "FAIL");
         $finish;
     end
 

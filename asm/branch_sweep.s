@@ -5,12 +5,16 @@
 #
 #   x20 = taken-count: incremented once per branch that WAS taken.
 #         11 of the 12 branches below are taken -> expect x20 == 11.
-#   mem[0] = x20, mem[4] = x21 (SLT/SLTU scratch, see corner_test below)
+#   mem[0] = x20, mem[4] = x21 (SLT/SLTU scratch, see corner_test below),
+#         where "mem[k]" is the dmem word DATA_BASE+k aliases onto - see
+#         core_defs.inc for why the data window had to move off address 0.
 #
-# run: make run_asm PROG=branch_sweep   (from RISC-V-Processor/sim)
-.text
-.globl _start
-_start:
+# run: make run_asm  PROG=branch_sweep   (core vs riscv_ref.v)
+#      make run_qemu PROG=branch_sweep   (core vs riscv_ref.v AND qemu-riscv32)
+#include "core_defs.inc"
+
+    CORE_DATA_REGION
+    CORE_ENTRY
     addi x1, x0, 5              # equal operands
     addi x2, x0, 5
     addi x3, x0, 7              # x3 > x1 (both positive small)
@@ -99,8 +103,7 @@ t_bge3: addi x20, x20, 1
 t_beqz: addi x20, x20, 1
 f_beqz:
 
-    sw   x20, 0(x0)     # taken-count, expect 11
-    sw   x21, 4(x0)     # slt+sltu sum, expect 1
+    sw   x20, 0(DATA_REG)     # taken-count, expect 11
+    sw   x21, 4(DATA_REG)     # slt+sltu sum, expect 1
 
-halt:
-    jal x0, halt
+    CORE_HALT

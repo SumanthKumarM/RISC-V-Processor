@@ -65,4 +65,4 @@ read_verilog -sv $rtl_srcs
 # messages; -name is passed so the run is reproducible in GUI mode too.
 synth_design -rtl -name rtl_1 -part $part -top $top
 
-report_methodology -file $report_dir/methodology.rpt -name methodology_1
+report_methodology -file $report_dir/methodology.rpt

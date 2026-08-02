@@ -1,25 +1,34 @@
 # Triple-nested loop with a conditional skip, exercising forward/backward
 # jal branches and multiple beq comparisons per level.
 #
-#   for i in 0..3:
-#     for j in 0..3:
-#       if i == j: continue        # skip_j corner: conditional skip of the
-#                                   # entire inner loop, not just one iter
-#       for k in 0..3:
-#         sum += i+j+k
-#         count += 1
+# The '|' prefixes below are load-bearing: these files are assembled through
+# cpp (-x assembler-with-cpp), which would read a comment line beginning
+# "#  if ..." as a real #if directive and fail to find its #endif.
+#
+#   | for i in 0..3:
+#   |   for j in 0..3:
+#   |     if i == j: continue      # skip_j corner: conditional skip of the
+#   |                              # entire inner loop, not just one iter
+#   |     for k in 0..3:
+#   |       sum += i+j+k
+#   |       count += 1
 #
 # i!=j pairs: 4*4-4=12, each contributing 4 k-iterations -> count = 48.
 # mem[0] = sum, mem[4] = count(=48).
 #
-# run: make run_asm PROG=nested_loops   (from RISC-V-Processor/sim)
-.text
-.globl _start
-_start:
+# "mem[k]" means the dmem word DATA_BASE+k aliases onto (see core_defs.inc).
+#
+# run: make run_asm  PROG=nested_loops   (core vs riscv_ref.v)
+#      make run_qemu PROG=nested_loops   (core vs riscv_ref.v AND qemu-riscv32)
+#include "core_defs.inc"
+
+    CORE_DATA_REGION
+    CORE_ENTRY
+
     addi x1,  x0, 0     # i
     addi x2,  x0, 4      # I_MAX = J_MAX = K_MAX
     addi x10, x0, 0       # sum
-    addi x11, x0, 0       # count
+    addi x11, x0, 0        # count
 
 outer_i:
     beq  x1, x2, done_i
@@ -44,8 +53,7 @@ next_i:
     addi x1, x1, 1
     jal  x0, outer_i
 done_i:
-    sw   x10, 0(x0)     # sum
-    sw   x11, 4(x0)     # count
+    sw   x10, 0(DATA_REG)     # sum
+    sw   x11, 4(DATA_REG)     # count
 
-halt:
-    jal x0, halt
+    CORE_HALT
